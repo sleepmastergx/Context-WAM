@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+runs/
+data/
+checkpoints/
+wandb/
+*.pt
+*.npz
+slurm-*.out
+.DS_Store

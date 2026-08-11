@@ -1,0 +1,35 @@
+# Training config for the MoveCube context-wam study.
+# BOTH arms read this file; the arm is picked by `train.py --arm {control,ttt}`
+# which loads configs/model/fastwam_ttt_m5{_control}.yaml. Run both arms with
+# the SAME seed and step count — checks/check_arms_match.py guards the model
+# side; this file is the half that must be passed identically.
+
+train_episodes: 90        # episodes 0..89 train; 90..99 held out for val
+batch_size: 32            # exec windows per optimizer step, summed over ranks
+num_epochs: 30
+learning_rate: 1.0e-4     # their from-scratch default (NOT a finetune LR)
+weight_decay: 1.0e-6      # memory `alpha` gets weight_decay 0 (must grow)
+max_grad_norm: 1.0
+mixed_precision: bf16     # the 5B engine only — the TTT memory is ALWAYS fp32
+seed: 42                  # IDENTICAL for both arms
+
+# ---- sliding memory (ttt arm only) --------------------------------------
+sliding_w: 8              # one write per 8 raw steps (settled 2026-08-11);
+                          # w=16 is the fallback lever if chain BPTT (depth
+                          # ~62) misbehaves — watch mem_gnorm in the logs
+chain_checkpoint_every: 0 # >0: gradient-checkpoint the chain in segments of
+                          # this many writes. EXACT gradients — the only legal
+                          # VRAM lever. Never detach the chain instead.
+
+log_every: 10
+save_every: 500           # each checkpoint is ~10 GiB (bf16 5B + fp32 EMA
+                          # shadows) — budget disk accordingly
+
+ema:
+  enabled: true           # their trainer has no EMA; our DP sweeps showed the
+  decay: 0.9999           # EMA weights are the ones worth evaluating
+
+wandb:
+  enabled: false          # flip on if the target cluster has wandb access
+  project: wam-ttt
+  group: movecube-fastwam

@@ -1,0 +1,21 @@
+# Fast-WAM's ZeRO-1 launch config (vendored from scripts/accelerate_configs/,
+# path adjusted: the DS json lives in this repo's configs/). Launch from the
+# REPO ROOT so the relative path below and ./checkpoints both resolve.
+compute_environment: LOCAL_MACHINE
+debug: false
+distributed_type: DEEPSPEED
+deepspeed_config:
+  deepspeed_config_file: configs/ds_zero1_config.json
+  zero3_init_flag: false
+
+# Keep this null when using deepspeed_config_file; precision is controlled by
+# train.py -> Accelerator(mixed_precision=cfg.mixed_precision) and the DS JSON.
+mixed_precision: null
+
+machine_rank: 0
+main_training_function: main
+num_machines: 1
+num_processes: 1
+rdzv_backend: static
+same_network: true
+use_cpu: false
