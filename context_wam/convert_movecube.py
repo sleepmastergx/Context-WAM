@@ -60,10 +60,9 @@ def mosaic(front_chw, wrist_chw):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--lerobot-root", default="/shared_work/george/wam_ttt/"
-                    "RoboMME_DP/data/robomme_data_lerobot_movecube")
-    ap.add_argument("--out", default="/shared_work/george/wam_ttt/exp/cache/"
-                    "movecube_fastwam")
+    ap.add_argument("--lerobot-root", required=True,
+                    help="LeRobot-format MoveCube dataset root")
+    ap.add_argument("--out", default="data/movecube_fastwam")
     ap.add_argument("--stride", type=int, default=1)
     ap.add_argument("--no-vae", action="store_true",
                     help="enumerate windows and shapes only; no GPU needed")
@@ -72,6 +71,9 @@ def main():
     ap.add_argument("--num-shards", type=int, default=1,
                     help="episode-sharded VAE pass; one process per GPU")
     args = ap.parse_args()
+    # the VAE branch chdirs into the fastwam root; keep outputs anchored
+    args.out = os.path.abspath(args.out)
+    args.lerobot_root = os.path.abspath(args.lerobot_root)
 
     import pandas as pd
     from PIL import Image
@@ -93,13 +95,16 @@ def main():
         # Load EXACTLY as their scripts/precompute_video_latents.py:381-392
         # does — resolve the registered config, then _load_registered_model.
         # (WanVideoVAE38 has no from_pretrained; that guess cost job 1391.)
-        sys.path.insert(0, "/shared_work/physical_intelligence/policies/"
-                           "Fast-WAM/fastwam/src")
+        import pathlib
+        fw_root = os.environ.get(
+            "FASTWAM_ROOT",
+            str(pathlib.Path(__file__).resolve().parents[1] / "third_party" / "fastwam"))
+        sys.path.insert(0, os.path.join(fw_root, "src"))
         import torch
         from fastwam.models.wan22.helpers.loader import (_load_registered_model,
                                                          _resolve_configs)
         # their config paths are RELATIVE to the fastwam repo root
-        os.chdir("/shared_work/physical_intelligence/policies/Fast-WAM/fastwam")
+        os.chdir(fw_root)
         _, _, vae_config, _ = _resolve_configs(
             model_id="Wan-AI/Wan2.2-TI2V-5B",
             tokenizer_model_id="Wan-AI/Wan2.1-T2V-1.3B",

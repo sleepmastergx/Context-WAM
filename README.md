@@ -19,6 +19,11 @@ raw step `t` reads the state after the last completed write strictly before
 `t` (`j_max(t) = (t-33)//8 + 1`). Both arms sample the SAME uniform-random
 exec windows, so the memory is the only difference.
 
+- **Step-by-step runbook:** [INSTRUCTIONS.md](INSTRUCTIONS.md)
+- **Design record** (write policy, in-graph chain, ablation ladder): [docs/DESIGN.md](docs/DESIGN.md)
+- **Training data**: [`SleepMastger/movecube-fastwam-cache`](https://huggingface.co/datasets/SleepMastger/movecube-fastwam-cache)
+  (HuggingFace, **private** — request access / use an authorized token)
+
 ## Setup (target cluster)
 
 ```bash

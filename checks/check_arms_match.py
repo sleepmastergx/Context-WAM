@@ -55,7 +55,7 @@ def main():
     per_layer = 23.1e6
     action = per_layer * a["action_dit_config.num_layers"]
     fusion = 10_242
-    sys.path.insert(0, "/shared_work/george/wam_ttt/exp/fastwam_ttt")
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "context_wam"))
     from per_layer_memory import PerLayerEpisodeMemory
     mem = PerLayerEpisodeMemory(
         n_layers=a["memory.n_layers"], hidden_dim=a["memory.hidden_dim"],

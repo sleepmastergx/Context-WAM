@@ -15,16 +15,19 @@ import sys
 
 GOAL = ("watch the video carefully, then move the cube to the target "
         "in the same manner as before")
-FW = "/shared_work/physical_intelligence/policies/Fast-WAM/fastwam"
+FW = os.environ.get(
+    "FASTWAM_ROOT",
+    str(__import__("pathlib").Path(__file__).resolve().parents[1]
+        / "third_party" / "fastwam"))
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default="/shared_work/george/wam_ttt/exp/cache/"
-                                     "movecube_fastwam/text_context.pt")
+    ap.add_argument("--out", default="data/movecube_fastwam/text_context.pt")
     ap.add_argument("--context-len", type=int, default=128)  # tokenizer_max_len
     ap.add_argument("--goal", default=GOAL)
     args = ap.parse_args()
+    args.out = os.path.abspath(args.out)   # we chdir below; keep out anchored
 
     if not os.environ.get("SLURM_JOB_ID"):
         sys.exit("T5-XXL needs a GPU: run inside a Slurm job")
