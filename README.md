@@ -67,7 +67,9 @@ alone is 56 GiB and will not fit without it. The TTT memory stays **outside**
 the engine in fp32 (bf16 quantizes the inner TTT update to noise); `train.py`
 optimizes it separately and all-reduces its grads. Checkpoints
 (`runs/*/checkpoints/step_*.pt`) contain model + memory + **EMA shadows**
-(~10 GiB each; evaluate the EMA weights).
+(~10 GiB each; evaluate the EMA weights). VRAM note: EMA shadows are fp32
+on-device, ~20 GiB for the 5B — sized for 140-GiB-class GPUs; on ~80 GiB
+cards set `ema.enabled: false` (and evaluate raw weights) or shrink the batch.
 
 Watch in `runs/*/log.jsonl` for the ttt arm: `gate` (|tanh α| — must grow off
 1e-3 for the memory to matter), `surprise`, `chain_J` (writes per chain, ≤~62),

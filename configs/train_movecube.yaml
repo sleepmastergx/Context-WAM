@@ -27,7 +27,11 @@ save_every: 500           # each checkpoint is ~10 GiB (bf16 5B + fp32 EMA
 
 ema:
   enabled: true           # their trainer has no EMA; our DP sweeps showed the
-  decay: 0.9999           # EMA weights are the ones worth evaluating
+  decay: 0.9999           # EMA weights are the ones worth evaluating.
+                          # COST: shadows are fp32 ON-DEVICE — ~20 GiB for the
+                          # 5B trainables (fp32 is required: bf16 swallows the
+                          # 1e-4 EMA increments). Fits H200/141G; on ~80 GiB
+                          # GPUs set enabled: false and evaluate raw weights.
 
 wandb:
   enabled: false          # flip on if the target cluster has wandb access
