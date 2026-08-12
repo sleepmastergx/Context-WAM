@@ -23,6 +23,10 @@ exec windows, so the memory is the only difference.
 - **Design record** (write policy, in-graph chain, ablation ladder): [docs/DESIGN.md](docs/DESIGN.md)
 - **Training data**: [`SleepMastger/movecube-fastwam-cache`](https://huggingface.co/datasets/SleepMastger/movecube-fastwam-cache)
   (HuggingFace, **private** — request access / use an authorized token)
+- **DP pipeline** (the predecessor study: stage-1 diffusion policy → stage-2
+  TTT arms 2/4a, now targeting **VideoUnmask** with query-color conditioning,
+  plus sim eval): [dp/README.md](dp/README.md). Raw VideoUnmask data:
+  [`SleepMastger/robomme-videounmask-raw`](https://huggingface.co/datasets/SleepMastger/robomme-videounmask-raw) (private)
 
 ## Setup (target cluster)
 
