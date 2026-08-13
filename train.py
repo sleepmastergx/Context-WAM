@@ -29,6 +29,26 @@ import pathlib
 import sys
 import time
 
+# ---- RunPod volume defaults ------------------------------------------------
+# The training image exports all of these, but a pod template's env vars
+# OVERRIDE the image's ENV, and a bare `docker run`/ssh shell may carry none of
+# them — in which case `--cache` resolves to None and the run dies on argument
+# parsing rather than on anything real. Filling them in here makes
+# `git clone && python train.py --arm ttt` work with no env setup at all.
+#
+# setdefault, so an explicitly exported value always wins; and only when the
+# path already exists, so a non-RunPod machine is untouched (there is no
+# /workspace there, and CACHE_DIR stays unset exactly as before).
+# Set before importing torch/transformers: HF_HOME is read at import time.
+for _var, _path in (("HF_HOME", "/workspace/hf_cache"),
+                    ("MODELSCOPE_CACHE", "/workspace/hf_cache/modelscope"),
+                    ("DIFFSYNTH_MODEL_BASE_PATH", "/workspace/checkpoints/"),
+                    ("CACHE_DIR", "/workspace/data/movecube_fastwam"),
+                    ("OUT_ROOT", "/workspace/outputs")):
+    if not os.environ.get(_var) and os.path.isdir(_path.rstrip("/") or "/"):
+        os.environ[_var] = _path
+os.environ.setdefault("PYTHONNOUSERSITE", "1")
+
 import numpy as np
 import torch
 import yaml

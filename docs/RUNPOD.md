@@ -16,6 +16,10 @@ dependency and never re-downloads a byte of data.
 
 1. Attach the **same** Network Volume at `/workspace`.
 2. Launch with image `ghcr.io/sleepmastergx/context-wam:cu128-torch271`.
+   The GHCR package is **private**, so add a RunPod container-registry
+   credential once (Settings -> Container Registry Auth): username
+   `sleepmastergx`, password = a GitHub PAT with `read:packages`. RunPod stores
+   it per-account, so later pods just pick the same credential.
 3. Source refresh:
    ```bash
    cd /workspace/projects/Context-WAM && git pull
@@ -29,7 +33,11 @@ dependency and never re-downloads a byte of data.
    ```
 
 No `setup.sh`, no `pip install`, no `source env.sh` — every path below is
-already exported by the image.
+already exported by the image, and `train.py` fills the same values in itself
+if the environment is missing them (a pod template's env vars override the
+image's `ENV`, and a bare ssh shell may carry neither). It only does that when
+the directory actually exists, so a non-RunPod machine behaves exactly as
+before. An explicitly exported value always wins.
 
 ## The paths (image `ENV`, so cwd-independent)
 
