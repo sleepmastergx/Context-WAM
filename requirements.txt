@@ -1,16 +1,38 @@
-# Known-good pins from the development environment (python 3.10).
-# torch must match the cluster's CUDA — 2.7.1+cu128 was used here; install it
-# per https://pytorch.org before the rest if pip resolves a different build.
-torch==2.7.1
+# Installed by setup.sh in a specific order — use `bash setup.sh`, not a bare
+# `pip install -r`, on a fresh machine:
+#   1. torch==2.7.1 + torchvision==0.22.1 from the cu128 index (deepspeed's
+#      build imports torch, and a bare install pulls the wrong CUDA build)
+#   2. deepspeed==0.18.5 --no-build-isolation
+#   3. this file
+#   4. third_party/fastwam with --no-deps (its pyproject pins exact "+cu128"
+#      local versions pip can't resolve; the real deps are all listed here)
 accelerate==1.12.0
-deepspeed==0.18.5
 transformers==4.49.0
-huggingface-hub<1.0
+huggingface-hub>=0.29,<1.0
 diffusers
-omegaconf
-hydra-core
-numpy
+omegaconf==2.3.0
+hydra-core==1.3.2
+numpy==1.26.4
 pyyaml
-einops
+einops==0.8.1
 safetensors
 wandb
+pandas==2.2.3
+pyarrow
+pillow
+imageio==2.37.0
+imageio-ffmpeg==0.6.0
+av==16.0.1
+datasets==3.6.0
+modelscope==1.34.0
+jsonlines==4.0.0
+rich
+termcolor
+regex
+tqdm
+gitpython
+packaging
+typing-extensions
+# NOT included: torchcodec (fastwam pyproject pins 0.5, but the training path
+# here consumes cached VAE latents and never decodes video; torchcodec has
+# fragile ffmpeg coupling — install only if you run their raw-video pipeline)

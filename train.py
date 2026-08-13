@@ -173,8 +173,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--arm", choices=("control", "ttt"), required=True)
     ap.add_argument("--config", default=str(HERE / "configs/train_movecube.yaml"))
-    ap.add_argument("--cache", default=None,
-                    help="downloaded window cache dir (scripts/download_data.py)")
+    ap.add_argument("--cache", default=os.environ.get("CACHE_DIR"),
+                    help="window cache dir; defaults to $CACHE_DIR "
+                         "(set by setup.sh's env.sh)")
     ap.add_argument("--out", default=None)
     ap.add_argument("--steps", type=int, default=None, help="cap for smoke runs")
     ap.add_argument("--synthetic", action="store_true",
@@ -189,7 +190,8 @@ def main():
         raise SystemExit(f"--arm {args.arm} does not match memory.enabled in "
                          f"{ARM_CFG[args.arm]}.yaml — refusing to guess")
 
-    out = pathlib.Path(args.out or (HERE / "runs" / f"fwam_{args.arm}"))
+    out = pathlib.Path(args.out or os.path.join(
+        os.environ.get("OUT_ROOT", str(HERE / "runs")), f"fwam_{args.arm}"))
 
     # ---------------------------------------------------------------- setup
     if args.synthetic:
@@ -212,7 +214,8 @@ def main():
         cache = SyntheticWindowCache(n_episodes=4, seed=cfg["seed"], device=device)
     else:
         if not args.cache:
-            raise SystemExit("pass --cache (see scripts/download_data.py)")
+            raise SystemExit("pass --cache or `source env.sh` for $CACHE_DIR "
+                             "(download: scripts/download_data.py)")
         from gpu_cache import GPUWindowCache
         # first train_episodes episodes train; the rest are held out for val,
         # mirroring the DP split discipline

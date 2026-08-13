@@ -14,4 +14,4 @@ export PYTHONNOUSERSITE=1
 accelerate launch --config_file configs/accelerate_zero1_ds.yaml \
     --num_processes "$NGPU" --main_process_port "${PORT:-29541}" \
     train.py --arm control --cache "$CACHE_DIR" \
-    --out "${OUT_DIR:-runs/fwam_control}" "$@"
+    --out "${OUT_DIR:-${OUT_ROOT:-runs}/fwam_control}" "$@"

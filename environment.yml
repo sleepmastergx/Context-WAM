@@ -1,0 +1,14 @@
+# Conda alternative to the venv that setup.sh creates. The staged pip install
+# (torch first, deepspeed --no-build-isolation, then requirements.txt) cannot
+# be expressed in a single conda pip block, so this file only provides the
+# interpreter — setup.sh does the rest inside it:
+#
+#   conda env create -f environment.yml
+#   conda activate context-wam
+#   SKIP_VENV=1 bash setup.sh
+name: context-wam
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip

@@ -28,7 +28,26 @@ exec windows, so the memory is the only difference.
   plus sim eval): [dp/README.md](dp/README.md). Raw VideoUnmask data:
   [`SleepMastger/robomme-videounmask-raw`](https://huggingface.co/datasets/SleepMastger/robomme-videounmask-raw) (private)
 
-## Setup (target cluster)
+## RunPod / fresh-machine quickstart
+
+```bash
+git clone https://github.com/sleepmastergx/Context-WAM.git /workspace/Context-WAM
+cd /workspace/Context-WAM
+export HF_TOKEN=...   # read access to the private dataset repo
+bash setup.sh         # staged deps, /workspace/{data,checkpoints,outputs,hf},
+                      # dataset download, then the CPU gates + smokes verify it
+source env.sh         # in every new shell
+python train.py --arm control      # paths default to /workspace via env.sh
+python train.py --arm ttt
+# multi-GPU (ZeRO-1): bash scripts/launch_control.sh, then launch_ttt.sh
+```
+
+Notes: without a writable `/workspace` (non-RunPod machine) setup.sh falls back
+to `./workspace`; `environment.yml` + `SKIP_VENV=1 bash setup.sh` is the conda
+variant; the `Dockerfile` is optional — the repo runs without it. The DP
+pipeline under `dp/` has its **own** environment (`bash dp/install_env.sh`).
+
+## Setup (manual, any cluster)
 
 ```bash
 git clone git@github.com:sleepmastergx/Context-WAM.git && cd Context-WAM
