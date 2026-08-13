@@ -66,7 +66,8 @@ def stats_of(arr):
 
 
 def convert_episode(args):
-    (h5_path, ep_name, ep_index, global_start, out_dir, gripper_mode) = args
+    (h5_path, ep_name, ep_index, global_start, out_dir, gripper_mode,
+     task_index) = args
     import h5py
     import datasets as hfds
 
@@ -125,7 +126,7 @@ def convert_episode(args):
         "frame_index": np.arange(T).tolist(),
         "episode_index": [ep_index] * T,
         "index": np.arange(global_start, global_start + T).tolist(),
-        "task_index": [0] * T,
+        "task_index": [task_index] * T,
     }, features=feats)
     os.makedirs(f"{out_dir}/data/{CHUNK}", exist_ok=True)
     ds.to_parquet(f"{out_dir}/data/{CHUNK}/episode_{ep_index:06d}.parquet",
@@ -139,7 +140,7 @@ def convert_episode(args):
         "frame_index": stats_of(np.arange(T)),
         "episode_index": stats_of(np.array([ep_index] * T)),
         "index": stats_of(np.arange(global_start, global_start + T)),
-        "task_index": stats_of(np.array([0] * T)),
+        "task_index": stats_of(np.array([task_index] * T)),
     }
     return ep_index, T, goal, exec_start, ep_stats
 
@@ -155,15 +156,29 @@ def main():
     args = p.parse_args()
     import h5py
 
+    # Pre-pass: lengths AND goals. The goal->task_index map must exist BEFORE
+    # the workers run, because task_index is a per-row parquet column and it is
+    # how the consumer resolves the goal text: RoboMMEDataset reads
+    # task_index off the episode's first row and CLIP-embeds tasks[that index]
+    # (eval_envs/dataset/robomme_dataset.py). Writing a constant 0 here would
+    # silently give every episode the first episode's goal -- harmless on a
+    # single-goal task like MoveCube, wrong for VideoUnmask, where the goal
+    # string carries the QUERY COLOR and 9 distinct strings appear.
     with h5py.File(args.h5, "r") as f:
         ep_names = sorted(f.keys())
-        lengths = []
+        lengths, ep_goals = [], []
         for n in ep_names:
             lengths.append(len([k for k in f[n].keys()
                                 if k.startswith("timestep")]))
+            ep_goals.append(f[n]["setup/task_goal"][()][0].decode())
     starts = np.concatenate([[0], np.cumsum(lengths)[:-1]])
 
-    jobs = [(args.h5, n, i, int(starts[i]), args.out, args.gripper_elem)
+    goals = {}
+    for g in ep_goals:
+        goals.setdefault(g, len(goals))
+
+    jobs = [(args.h5, n, i, int(starts[i]), args.out, args.gripper_elem,
+             goals[ep_goals[i]])
             for i, n in enumerate(ep_names)]
     results = []
     with ProcessPoolExecutor(max_workers=args.workers) as ex:
@@ -173,10 +188,9 @@ def main():
     results.sort()
 
     os.makedirs(f"{args.out}/meta", exist_ok=True)
-    goals = {}
-    for _, _, goal, _, _ in results:
-        goals.setdefault(goal, len(goals))
     assert len(goals) >= 1
+    # the workers saw the same map; re-derive from their returns and cross-check
+    assert {g for _, _, g, _, _ in results} == set(goals), "goal set drift"
     with open(f"{args.out}/meta/tasks.jsonl", "w") as fh:
         for g, ti in goals.items():
             fh.write(json.dumps({"task_index": ti, "task": g}) + "\n")

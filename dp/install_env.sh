@@ -36,7 +36,13 @@ git -C "$EXT/DP" checkout -q "$DP_PIN"
 # gymnasium 0.29.1
 uv pip install --python "$VENV/bin/python" -e "$EXT/robomme_benchmark"
 
-# DP deps. lerobot: their environment.yml pins 0.3.3, but 0.3.3 caps
+# DP deps. The datasets UPPER bound is load-bearing: lerobot 0.3.3 declares
+# datasets<=3.6.0, and from 4.0 ds["col"] returns a lazy Column instead of a
+# list, so lerobot's torch.stack(hf_dataset["timestamp"]) raises TypeError.
+# 4.0+ also writes the parquet feature as _type:List, which 3.6.0 cannot read
+# back -- so writer and reader must agree, and convert_h5_to_lerobot.py must
+# run in THIS venv, not a system python that resolved a newer datasets.
+# lerobot: their environment.yml pins 0.3.3, but 0.3.3 caps
 # torchvision<0.23 while the benchmark pins torchvision 0.24.1 (the authors
 # used two envs). Resolution (verified working): install lerobot WITHOUT deps
 # — our data is image-parquet, none of the capped pins are exercised. A plain
@@ -44,9 +50,14 @@ uv pip install --python "$VENV/bin/python" -e "$EXT/robomme_benchmark"
 uv pip install --python "$VENV/bin/python" \
     hydra-core omegaconf diffusers transformers einops wandb \
     pyarrow pandas opencv-python-headless "imageio[ffmpeg]" \
-    "datasets>=2.19" jsonlines draccus deepdiff h5py
+    "datasets>=2.19,<=3.6.0" jsonlines draccus deepdiff h5py
 uv pip install --python "$VENV/bin/python" -e "$EXT/DP"
 uv pip install --python "$VENV/bin/python" --no-deps "lerobot==0.3.3"
+# ...but --no-deps also drops PyAV, and lerobot/datasets/lerobot_dataset.py
+# imports video_utils -> `import av` at MODULE level, so LeRobotDataset is
+# unimportable without it even though our data is image-parquet, not video.
+# Installed on its own: it pulls no torch pin, so 2.9.1 survives.
+uv pip install --python "$VENV/bin/python" av
 # re-assert the benchmark's torch in case any dep nudged it
 uv pip install --python "$VENV/bin/python" "torch==2.9.1" "torchvision==0.24.1"
 

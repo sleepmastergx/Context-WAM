@@ -20,3 +20,6 @@ env.sh
 slurm-*.out
 .DS_Store
 *.egg-info/
+
+# pipeline logs
+*.log
