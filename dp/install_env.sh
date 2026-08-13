@@ -47,10 +47,20 @@ uv pip install --python "$VENV/bin/python" -e "$EXT/robomme_benchmark"
 # used two envs). Resolution (verified working): install lerobot WITHOUT deps
 # — our data is image-parquet, none of the capped pins are exercised. A plain
 # "pip install lerobot" DOWNGRADES torch to 2.2.x and breaks transformers.
+# transformers/diffusers are pinned to what DP's own environment.yml declares.
+# Unpinned they drift past breaking changes: transformers 5.x makes
+# CLIPModel.get_text_features return BaseModelOutputWithPooling instead of a
+# tensor, so ClipTextEmbedder dies with "'BaseModelOutputWithPooling' object
+# has no attribute 'norm'" -- i.e. the goal-string embedding, which IS the
+# query-colour conditioning for VideoUnmask. diffusers supplies DDPMScheduler
+# and the LR scheduler, so it is pinned for the same reason.
+# numpy/pandas/pyarrow are deliberately NOT pinned to DP's values: the
+# benchmark's mani-skill fork constrains them, and the installed set is gated
+# bit-exact by dp/check_cache_equiv.py.
 uv pip install --python "$VENV/bin/python" \
-    hydra-core omegaconf diffusers transformers einops wandb \
+    hydra-core omegaconf "diffusers==0.34.0" "transformers==4.54.1" einops wandb \
     pyarrow pandas opencv-python-headless "imageio[ffmpeg]" \
-    "datasets>=2.19,<=3.6.0" jsonlines draccus deepdiff h5py
+    "datasets>=2.19,<=3.6.0" jsonlines draccus deepdiff h5py hf_transfer
 uv pip install --python "$VENV/bin/python" -e "$EXT/DP"
 uv pip install --python "$VENV/bin/python" --no-deps "lerobot==0.3.3"
 # ...but --no-deps also drops PyAV, and lerobot/datasets/lerobot_dataset.py
