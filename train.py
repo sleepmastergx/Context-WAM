@@ -117,7 +117,10 @@ class SyntheticWindowCache:
         B = idx.shape[0]
         return {"video_latents": self.latents[idx],
                 "action": self.actions[idx],
-                "proprio": self.states[idx],
+                # [B,1,P] — mirrors GPUWindowCache.batch(); the two caches are
+                # duck-typed and must agree, or the synthetic smoke keeps
+                # passing while the real model path raises on the shape.
+                "proprio": self.states[idx].unsqueeze(1),
                 "is_exec": self.is_exec[idx],
                 "context": self.context.unsqueeze(0).expand(B, -1, -1),
                 "context_mask": self.context_mask.unsqueeze(0).expand(B, -1),

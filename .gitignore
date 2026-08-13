@@ -19,3 +19,4 @@ env.sh
 *.h5
 slurm-*.out
 .DS_Store
+*.egg-info/

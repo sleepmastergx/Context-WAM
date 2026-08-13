@@ -17,6 +17,15 @@ pyyaml
 einops==0.8.1
 safetensors
 wandb
+boto3            # fastwam/utils/misc.py imports it at MODULE level, so
+                 # `fastwam.runtime` (and therefore every real model build) is
+                 # unimportable without it. Only the synthetic smoke survives
+                 # its absence, which is why setup.sh alone did not catch this.
+ftfy             # wan_video_text_encoder falls back to a no-op fix_text when
+                 # missing: silent, not an error. Cheap to just install.
+hf_transfer      # huggingface_hub HARD-ERRORS at download time when
+                 # HF_HUB_ENABLE_HF_TRANSFER=1 (RunPod images export it) and
+                 # the package is absent.
 pandas==2.2.3
 pyarrow
 pillow

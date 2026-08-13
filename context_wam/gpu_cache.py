@@ -107,7 +107,12 @@ class GPUWindowCache:
         B = idx.shape[0]
         return {"video_latents": self.latents[idx],
                 "action": self.actions[idx],
-                "proprio": self.states[idx],
+                # [B,1,P], not [B,P]: their build_inputs demands a 3D
+                # [B,T,d] proprio and then takes `proprio[:, 0, :]`. One state
+                # per window IS T=1, so this is a reshape, not a change of
+                # meaning. `self.states` stays 2D — SlidingChain indexes it
+                # directly as [E,J,P].
+                "proprio": self.states[idx].unsqueeze(1),
                 "is_exec": self.is_exec[idx],
                 "context": self.context.unsqueeze(0).expand(B, -1, -1),
                 "context_mask": self.context_mask.unsqueeze(0).expand(B, -1),
