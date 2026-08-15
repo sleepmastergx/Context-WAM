@@ -37,3 +37,4 @@ wandb:
   enabled: false          # flip on if the target cluster has wandb access
   project: wam-ttt
   group: movecube-fastwam
+  tags: [fastwam, movecube]   # train.py appends the arm

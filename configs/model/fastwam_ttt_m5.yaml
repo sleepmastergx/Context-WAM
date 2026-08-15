@@ -44,7 +44,16 @@ redirect_common_files: true
 mot_checkpoint_mixed_attn: true
 
 action_dit_pretrained_path: null
-skip_dit_load_from_pretrain: true
+skip_dit_load_from_pretrain: false   # was true — see comment 3 above. That flag
+                                     # is passed to BOTH experts: loader.py
+                                     # random-inits the 5B VIDEO DiT under it
+                                     # (dit_path = SKIPPED_PRETRAIN sentinel),
+                                     # which is the opposite of the stated
+                                     # intent and NaN'd this task at step ~2.
+                                     # false + action_dit_pretrained_path: null
+                                     # gives what comment 3 describes: video
+                                     # backbone pretrained, action expert still
+                                     # truncated-Gaussian random init.
 freeze_video_backbone: false
 decoupled: true
 

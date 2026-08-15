@@ -1,0 +1,123 @@
+# Training config for the VideoUnmask context-wam study.
+# Sibling of train_movecube.yaml — same knobs, same discipline: BOTH arms read
+# this file, the arm is picked by `train.py --arm {control,ttt}`, and both arms
+# must run with the SAME seed and step count. check_arms_match.py guards the
+# model side; this file is the half that must be passed identically.
+#
+# Differences from train_movecube.yaml and why:
+#   * wandb on (group videounmask-fastwam) — the DP stage-1 run on this task
+#     logged to the same project, so the arms stay comparable in one place.
+# Everything else is deliberately identical to the MoveCube study.
+#
+# Data: data/robomme_data_lerobot_videounmask -> $CACHE_DIR window cache.
+# 100 episodes, 18,468 windows (11,868 exec), exec_start = 66 in every episode
+# so every exec window has j_max >= 5 completed writes to read.
+
+train_episodes: 90        # episodes 0..89 train; 90..99 held out for val
+batch_size: 16            # MEASURED, not estimated. Dropping DeepSpeed did NOT
+                          # free enough for the study's 32: that OOM'd again at
+                          # 176.6 GiB (needed ~181). Two real data points —
+                          # batch 8 = 109.8 GiB, batch 32 = ~181 GiB — give
+                          # ~2.9 GiB/sample of activations and a fixed cost of
+                          # ~89 GiB (my earlier ~42 GiB estimate was wrong).
+                          # batch 16 -> ~135 GiB, ~43 GiB spare, which also
+                          # leaves room for the ttt arm's in-graph chain (and
+                          # that arm has chain_checkpoint_every as its own
+                          # sanctioned VRAM lever, so both arms can stay at 16).
+                          # STILL A DEVIATION from the study's 32 — see below.
+                          # Kept the earlier analysis for the record:
+                          # ---- why it was temporarily 8 ----
+                          # DEVIATION from the MoveCube study's 32. MEASURED on
+                          # this pod 2026-08-14: batch 32 OOMs on a single B200
+                          # (178 GiB usable) in kv_fusion's forward, twice —
+                          # once with EMA on (173.9 GiB) and again with EMA off
+                          # (175.0 GiB), so EMA was not the driver.
+                          # Budget at batch 32, one GPU (ZeRO-1 shards nothing
+                          # with no peer rank):
+                          #   fixed ~106 GiB  bf16 params 10.4 + bf16 grads 10.4
+                          #                   + fp32 master 20.7 + fp32 grads
+                          #                   20.7 + Adam m/v 41.4 + cache 2.3
+                          #   activations ~69 GiB  fused_mlp materializes ALL 30
+                          #                   video layers (all_k ~9 GiB each)
+                          # Activations are the only term that scales with batch
+                          # and the only one reachable without changing the
+                          # architecture (uniform_end would cut it ~6x but that
+                          # IS deliberate change #1 in the model config).
+                          # batch 8 -> activations ~17 GiB, ~123 GiB total,
+                          # leaving room for the ttt arm's in-graph chain (J~43)
+                          # so BOTH arms run under identical settings.
+                          # COST: 4x the optimizer steps at the same LR, and not
+                          # comparable to MoveCube's batch-32 numbers. To restore
+                          # the exact recipe, micro-batch 8 x grad-accum 4 would
+                          # keep effective batch 32 — train.py hardcodes
+                          # gradient_accumulation_steps=1, so that needs a loop
+                          # change, not a config knob.
+                          # ---- why 32 is back ----
+                          # This run does NOT use DeepSpeed. ZeRO-1 shards
+                          # optimizer state ACROSS RANKS; with one rank it
+                          # shards against nobody while still paying fp32
+                          # master + fp32 grad copies (~64 GiB). Without it the
+                          # fixed cost is ~42 GiB (bf16 params 10.4 + bf16 grads
+                          # 10.4 + bf16 Adam states 20.8), so batch 32's ~92 GiB
+                          # of activations fits inside 178 GiB.
+                          # It is also the CORRECT path: MEASURED 2026-08-14,
+                          # DeepSpeed lets a step-3 gradient spike (norm 87.6)
+                          # overflow video_expert.patch_embedding despite
+                          # gradient_clipping: 1.0, while plain torch clips the
+                          # same spike (norm 66.5) and recovers — loss 2.09 ->
+                          # 0.83 over 20 steps. See scripts/launch_single_gpu.sh.
+num_epochs: 30            # 30 passes over the data: 332 steps/epoch at batch 32
+learning_rate: 1.0e-4     # their from-scratch default (NOT a finetune LR)
+weight_decay: 1.0e-6      # memory `alpha` gets weight_decay 0 (must grow)
+max_grad_norm: 1.0
+mixed_precision: bf16     # the 5B engine only — the TTT memory is ALWAYS fp32
+seed: 42                  # IDENTICAL for both arms
+
+# ---- sliding memory (ttt arm only) --------------------------------------
+sliding_w: 8              # one write per 8 raw steps (settled 2026-08-11);
+                          # w=16 is the fallback lever if chain BPTT misbehaves
+                          # — watch mem_gnorm in the logs. VideoUnmask episodes
+                          # are shorter than MoveCube's: max J ~ 43 (< ~62).
+chain_checkpoint_every: 0 # >0: gradient-checkpoint the chain in segments of
+                          # this many writes. EXACT gradients — the only legal
+                          # VRAM lever. Never detach the chain instead.
+
+log_every: 10
+save_every: 3320          # EVERY 5 EPOCHS (requested): 664 steps/epoch at batch
+                          # 16 x 5 = 3320, so the 19,920-step run writes exactly
+                          # 6 checkpoints (steps 3320, 6640, 9960, 13280, 16600,
+                          # 19920 = the final one). Each is ~10 GiB (bf16 5B, no
+                          # EMA shadows since ema.enabled is false below), so
+                          # ~60 GiB total against ~437 TiB free — the real cost
+                          # is write time to the network filesystem, and 6
+                          # writes is cheap.
+
+ema:
+  enabled: false          # MEASURED on this pod, 2026-08-14: with EMA on, a
+  decay: 0.9999           # single B200 (178 GiB usable) OOMs in kv_fusion's
+                          # forward at 173.9 GiB. One GPU means ZeRO-1 has no
+                          # peer to shard against, so this card carries the
+                          # whole recipe alone:
+                          #   bf16 params            10.4 GiB
+                          #   fp32 master+grad+m+v   82.8 GiB
+                          #   fp32 EMA shadows       20.7 GiB  <- this
+                          #   window cache            2.3 GiB
+                          # leaving too little for the fused-MLP activations
+                          # (all_k over 30 video layers is ~9 GiB at batch 32).
+                          # README sanctions exactly this trade ("on ~80 GiB
+                          # GPUs set enabled: false and evaluate raw weights").
+                          # CONSEQUENCE: evaluate RAW weights, not EMA shadows —
+                          # unlike the MoveCube runs and the DP sweeps, where
+                          # the EMA weights were the ones worth evaluating.
+                          # Both arms share this setting, so control vs ttt
+                          # stays a fair comparison; only cross-study
+                          # comparisons to EMA-evaluated numbers are affected.
+
+wandb:
+  enabled: true
+  project: wam-ttt
+  group: videounmask-fastwam
+  tags: [fastwam, videounmask]   # train.py appends the arm. Runs before
+                                 # 2026-08-14 are tagged `movecube` by mistake
+                                 # (it was hardcoded); the GROUP was always
+                                 # right, so filter by group, not by tag.

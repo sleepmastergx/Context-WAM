@@ -320,7 +320,11 @@ def main():
             wb = wandb.init(project=cfg["wandb"]["project"],
                             group=cfg["wandb"]["group"],
                             name=f"fwam_{args.arm}", dir=str(out),
-                            tags=["fastwam", "movecube", args.arm],
+                            # task tag comes from the config, NOT hardcoded --
+                            # it read "movecube" on every run until 2026-08-14,
+                            # which mistagged the whole VideoUnmask study.
+                            tags=[*cfg["wandb"].get("tags", ["fastwam"]),
+                                  args.arm],
                             config={k: v for k, v in cfg.items() if k != "model"})
             print(f"wandb: {wb.url}", flush=True)
         except Exception as e:                                    # noqa: BLE001

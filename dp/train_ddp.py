@@ -64,6 +64,20 @@ CKPT_EVERY = 10_000
 LOG_EVERY = 100
 
 
+def snapshot(sd):
+    """Detached CPU copy of a state_dict.
+
+    state_dict() hands back live references to the parameters. The EMA
+    copy_to/restore pair below mutates those same tensors in place, so without
+    a real copy both checkpoint entries end up aliasing one storage and
+    serialize the restored RAW weights -- torch.save dedupes the shared
+    storage, so the file size looks correct and nothing errors. to(copy=True)
+    (not .cpu(), which is a no-op when already on CPU) also keeps the second
+    copy off the GPU.
+    """
+    return {k: v.detach().to("cpu", copy=True) for k, v in sd.items()}
+
+
 class LossShim(torch.nn.Module):
     """DDP gradient hooks only fire on forward(); route compute_loss through it."""
     def __init__(self, model):
@@ -274,14 +288,17 @@ def main():
             t0, data_t = time.time(), 0.0
 
         if is_main and (step % ckpt_every == 0 or step == total_steps):
-            ck = {"model": raw.state_dict(), "global_step": step}
+            ck = {"model": snapshot(raw.state_dict()), "global_step": step}
             if ema is not None:
                 # store EMA weights in their ckpt["model"] convention too:
                 # their serve loads ckpt["model"], and eval should use EMA
                 ema.store(raw.parameters())
                 ema.copy_to(raw.parameters())
-                ck["model_ema"] = raw.state_dict()
+                ck["model_ema"] = snapshot(raw.state_dict())
                 ema.restore(raw.parameters())
+                assert any(not torch.equal(ck["model"][k], ck["model_ema"][k])
+                           for k in ck["model"]), \
+                    "model_ema is identical to model -- the snapshot aliased"
             tmp = os.path.join(run_dir, f".tmp_ckpt_{step}.pth")
             torch.save(ck, tmp)
             shutil.move(tmp, os.path.join(run_dir, f"ckpt_{step}.pth"))

@@ -47,7 +47,16 @@ def main():
         "FAIL: memory.enabled is not True/False across the arms"
     assert a["action_dit_config.num_layers"] == b["action_dit_config.num_layers"]
     assert a["kv_source_mode"] == b["kv_source_mode"] == "fused_mlp"
-    assert a["skip_dit_load_from_pretrain"] is True
+    # Was pinned to True. loader.py passes this flag to BOTH experts, and under
+    # True it random-inits the 5B VIDEO DiT (dit_path = SKIPPED_PRETRAIN), not
+    # just the action expert — the opposite of what the model config's comment 3
+    # states ("the Wan2.2 video backbone keeps its pretrained weights"). On
+    # VideoUnmask that produced finite loss at step 1 and NaN by step ~2.
+    # False + action_dit_pretrained_path: null keeps the action expert on
+    # truncated-Gaussian random init, which is the documented intent.
+    assert a["skip_dit_load_from_pretrain"] is False
+    assert a["action_dit_pretrained_path"] is None, \
+        "action expert must stay from-scratch: null path + skip=False"
     assert a["freeze_video_backbone"] is False, \
         "their recipe trains BOTH experts; only VAE+T5 are frozen"
 

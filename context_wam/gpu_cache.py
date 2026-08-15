@@ -77,24 +77,45 @@ class GPUWindowCache:
         self.ep = torch.cat(ep_id).to(self.device)
         self.start = torch.cat(start).to(self.device)
         self.is_exec = torch.cat(is_exec).to(self.device)
-        # shared text context (one goal string for all of MoveCube)
+        # Text context. MoveCube: ONE goal shared by every window. VideoUnmask:
+        # the goal names the query color, so the context is per EPISODE and is
+        # gathered per window — sharing one context there would make the model
+        # blind to the query (see encode_text_context.py).
         tpath = os.path.join(root, "text_context.pt")
         if not os.path.exists(tpath):
             raise FileNotFoundError(
                 f"missing {tpath} — run encode_text_context.py "
                 "(their training_loss requires sample['context'])")
         tp = torch.load(tpath, map_location="cpu")
-        self.context = tp["context"].to(self.device, dtype)      # [L, 4096]
-        self.context_mask = tp["mask"].to(self.device)           # [L] bool
+        self.per_episode_text = "contexts" in tp
+        if self.per_episode_text:
+            self.contexts = tp["contexts"].to(self.device, dtype)  # [K, L, 4096]
+            self.context_masks = tp["masks"].to(self.device)       # [K, L] bool
+            ep_task = {int(k): int(v) for k, v in tp["ep_task"].items()}
+            missing = keep - set(ep_task)
+            if missing:
+                raise KeyError(f"text_context.pt has no goal for episodes "
+                               f"{sorted(missing)} — re-run encode_text_context.py "
+                               f"--lerobot-root against THIS dataset")
+            # per-window goal id, so batch() is one index_select like the rest
+            self.win_task = torch.tensor(
+                [ep_task[int(e)] for e in self.ep.tolist()],
+                dtype=torch.long, device=self.device)
+            self.context = self.context_mask = None
+        else:
+            self.context = tp["context"].to(self.device, dtype)   # [L, 4096]
+            self.context_mask = tp["mask"].to(self.device)        # [L] bool
         C, T, H, W = 3, 9, 256, 512
         assert T % 4 == 1 and H % 16 == 0 and W % 16 == 0
         self.source_video_shape = torch.tensor([[C, T, H, W]], device=self.device)
 
         n_bytes = sum(t.numel() * t.element_size() for t in
                       (self.latents, self.actions, self.states))
+        txt = (f"{len(self.contexts)} per-episode goals"
+               if self.per_episode_text else "1 shared goal")
         print(f"[GPUWindowCache] {len(self.latents)} windows from {len(eps)} "
               f"episodes, {n_bytes/2**30:.2f} GiB resident on {self.device} "
-              f"({int(self.is_exec.sum())} exec)", flush=True)
+              f"({int(self.is_exec.sum())} exec, {txt})", flush=True)
 
     def __len__(self):
         return len(self.latents)
@@ -105,6 +126,12 @@ class GPUWindowCache:
     def batch(self, idx):
         """Gather on-device; no host round-trip."""
         B = idx.shape[0]
+        if self.per_episode_text:
+            t = self.win_task[idx]
+            ctx, ctx_mask = self.contexts[t], self.context_masks[t]
+        else:
+            ctx = self.context.unsqueeze(0).expand(B, -1, -1)
+            ctx_mask = self.context_mask.unsqueeze(0).expand(B, -1)
         return {"video_latents": self.latents[idx],
                 "action": self.actions[idx],
                 # [B,1,P], not [B,P]: their build_inputs demands a 3D
@@ -114,6 +141,6 @@ class GPUWindowCache:
                 # directly as [E,J,P].
                 "proprio": self.states[idx].unsqueeze(1),
                 "is_exec": self.is_exec[idx],
-                "context": self.context.unsqueeze(0).expand(B, -1, -1),
-                "context_mask": self.context_mask.unsqueeze(0).expand(B, -1),
+                "context": ctx,
+                "context_mask": ctx_mask,
                 "source_video_shape": self.source_video_shape.expand(B, -1)}
