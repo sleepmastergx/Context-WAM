@@ -163,8 +163,26 @@ def main():
     ap.add_argument("--shard", type=int, default=0)
     ap.add_argument("--num-shards", type=int, default=1)
     ap.add_argument("--raw-weights", action="store_true")
+    ap.add_argument("--render-backend", default=None,
+                    help="ManiSkill render backend. Leave unset for GPU. Pass "
+                         "'cpu' on a pod whose /dev/dri render node is not "
+                         "openable (see checks/check_vulkan.py) -- correct but "
+                         "far slower.")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
+
+    if args.render_backend:
+        # Same wrap as dp/eval_dp.py: BenchmarkEnvBuilder hardcodes its
+        # gym.make kwargs, so this is the only way to reach ManiSkill's
+        # render_backend without forking the pinned benchmark clone.
+        import gymnasium as gym
+        _orig_make = gym.make
+
+        def _make_with_backend(env_id, **kw):
+            kw.setdefault("render_backend", args.render_backend)
+            return _orig_make(env_id, **kw)
+
+        gym.make = _make_with_backend
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ck = torch.load(os.path.join(args.run_dir, "checkpoints", args.ckpt),

@@ -31,6 +31,34 @@ export PATH=$PWD/.venv-dp/bin:$PATH
 This env is separate from the Fast-WAM one (torch 2.9.1 vs 2.7.1). Sim eval
 needs a GPU node with Vulkan.
 
+**Gate the renderer before spending time on a new pod:**
+
+```bash
+python checks/check_vulkan.py     # 0 = GPU, 1 = CPU-only (lavapipe), 2 = none
+```
+
+`NVIDIA_DRIVER_CAPABILITIES=all` is necessary but not sufficient. The NVIDIA
+Vulkan ICD must also open a DRM render node, and some RunPod pods bind-mount
+`/dev/dri/renderD*` from the host owned by a uid outside the container's user
+namespace — root then gets EACCES (`cap_dac_override` does not cross a userns
+boundary) and sapien reports the misleading "failed to find a rendering
+device". Nothing inside the pod fixes it: `mknod` is barred in a userns, the
+nodes are busy bind-mounts, and `unshare -Urm` is denied. Get a pod whose
+render node is openable.
+
+Failing that, CPU rendering works — correctly, but ~an order of magnitude
+slower:
+
+```bash
+apt-get update && apt-get install -y mesa-vulkan-drivers   # lavapipe; ephemeral
+# env-dp.sh then auto-selects the lavapipe ICD and says so.
+python dp/eval_dp.py ... --render-backend cpu   # ManiSkill still defaults to gpu
+```
+
+Measured on an L4 pod sharing the box with two trainings: 8.5 sim steps/s plus
+~45 ms/step of policy. A *failed* episode burns the full 1300-step budget
+(~13 min); a success ends in ~100 steps (~1 min).
+
 ## Data
 
 Raw episodes (pre-precompute, by design):
@@ -62,6 +90,8 @@ torchrun --nproc-per-node=2 --rdzv-backend=c10d --rdzv-endpoint=127.0.0.1:29513 
 # 3) val checkpoint sweep -> pick the winner (repeat per ckpt, shardable)
 python dp/eval_dp.py --run-dir runs/dp_stage1 --ckpt ckpt_200000.pth \
     --task VideoUnmask --split val --episodes 50
+# or, sharded + merged for you (adds --render-backend cpu when on lavapipe):
+bash scripts/eval_videounmask.sh ckpt_200000.pth val 50 8
 
 # 4) stage-2 feature cache. --with-text is REQUIRED for VideoUnmask: the
 #    query color lives in the goal string; without it the arms are blind to
