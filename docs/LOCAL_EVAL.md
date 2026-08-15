@@ -41,12 +41,14 @@ None of this is in git (`data/`, `runs/`, `cache/` are ignored — they are
 gigabytes).
 
 ```bash
-# raw episodes -> LeRobot parquet (~2.6 GB result)
-python -c "from huggingface_hub import hf_hub_download; hf_hub_download(
-  'SleepMastger/robomme-videounmask-raw', 'record_dataset_VideoUnmask.h5',
-  repo_type='dataset', local_dir='data')"
-python dp/convert_h5_to_lerobot.py --h5 data/record_dataset_VideoUnmask.h5 \
-    --out data/robomme_data_lerobot_videounmask --verify
+# LeRobot dataset, already converted (~2.6 GB) -- this is all eval needs
+python -c "from huggingface_hub import snapshot_download; snapshot_download(
+  'SleepMastger/robomme-videounmask-raw', repo_type='dataset', local_dir='data',
+  allow_patterns='robomme_data_lerobot_videounmask/*')"
+
+# only if you need to re-derive it: the 14 GB source h5 lives in the same repo
+#   python dp/convert_h5_to_lerobot.py --h5 data/record_dataset_VideoUnmask.h5 \
+#       --out data/robomme_data_lerobot_videounmask --verify
 
 # stage-1 DP checkpoints + config.yaml + stats.json -> runs/dp_stage1/
 python -c "from huggingface_hub import snapshot_download; snapshot_download(
@@ -56,12 +58,20 @@ python -c "from huggingface_hub import snapshot_download; snapshot_download(
 Both HF repos are **private** — your token needs read access
 (`huggingface-cli login`, or `HF_TOKEN`).
 
-**Stage-2 arm checkpoints are not published anywhere yet.** `runs/arm2_control`
-and `runs/arm4a_concat` are ~11 GB and ~12 GB of `.ckpt` files plus
-`cache/feats.npz` (2.6 MB), and they exist only on the training box. Either copy
-those three paths across by hand, or push them to HF the same way stage-1 was
-(`scripts/hf_sync.py`). Without them you can run stage-1 eval but not the arm
-comparison.
+```bash
+# stage-2 arms: every .ckpt for both arms, the training logs, the frozen-feature
+# cache, and whatever eval results existed at upload time
+python -c "from huggingface_hub import snapshot_download; snapshot_download(
+  'SleepMastger/context-wam-videounmask-stage2', local_dir='stage2_dl')"
+# then place them where the runners expect:
+#   stage2_dl/arm2_control/*.ckpt -> runs/arm2_control/checkpoints/
+#   stage2_dl/arm4a_concat/*.ckpt -> runs/arm4a_concat/checkpoints/
+#   stage2_dl/cache/feats.npz     -> cache/feats.npz
+```
+
+For Fast-WAM (not needed for DP eval) the precomputed latent window cache is
+`SleepMastger/context-wam-videounmask-fastwam-cache` — 100 `ep*.npz` shards plus
+`text_context.pt`, which `train.py --cache` reads directly.
 
 ## 3. Eval
 
