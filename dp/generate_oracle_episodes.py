@@ -10,12 +10,19 @@ written (RecordWrapper gates write() on episode_success), so every recorded
 episode is a valid demonstration; failures retry at seed+1 (up to
 --max-attempts).
 
-Seeds: episode i uses --base-seed + i*1000 (+attempt). Default 2,000,000 --
-far above the official train (6,000-15,900), test (560,000+) and val
-(1,060,000+) ranges, so no split leakage.
+Seeds: episode N uses --base-seed + N*1000 (+attempt), keyed off the ABSOLUTE
+episode number so runs with different --start can never collide. Default
+3,000,000 -- far above the official train (6,000-15,900), test (560,000+) and
+val (1,060,000+) ranges, so no split leakage. NOTE: the first published 400
+episodes (episode_100-499 in robomme-videounmask-raw) predate this scheme;
+they were generated with run-relative seeds 2,000,000 + idx*1000 -- their
+exact seeds are recorded in the h5 setup/seed fields and oracle_extra_logs/.
+The 3,000,000 default keeps every future episode-keyed seed disjoint from
+that published range.
 
 Difficulty matches the official train mix 2:1:1 (easy:medium:hard) via
-episode-index round robin (i%4 -> easy,easy,medium,hard).
+absolute-episode round robin (N%4 -> easy,easy,medium,hard), so an episode's
+difficulty is a function of its number alone, not of run partitioning.
 
 Output: <out>/hdf5_files/VideoUnmask_ep<N>_seed<S>.h5, one per episode, each
 holding a single `episode_<N>` group in the record_dataset format; merge them
@@ -176,7 +183,7 @@ def main():
     ap.add_argument("--start", type=int, default=100,
                     help="first episode number (official train is 0-99)")
     ap.add_argument("--count", type=int, default=400)
-    ap.add_argument("--base-seed", type=int, default=2_000_000)
+    ap.add_argument("--base-seed", type=int, default=3_000_000)
     ap.add_argument("--max-attempts", type=int, default=30)
     ap.add_argument("--shard", type=int, default=0)
     ap.add_argument("--num-shards", type=int, default=1)
@@ -189,7 +196,11 @@ def main():
     my_eps = list(range(args.count))[args.shard::args.num_shards]
     for idx in my_eps:
         episode = args.start + idx
-        difficulty = DIFF_MIX[idx % len(DIFF_MIX)]
+        # Key seed and difficulty off the ABSOLUTE episode number, not the
+        # run-relative idx: idx restarts at 0 every invocation, so idx-keyed
+        # seeds collide across runs with different --start, and idx-keyed
+        # difficulty re-anchors the 2:1:1 mix whenever --start % 4 != 0.
+        difficulty = DIFF_MIX[episode % len(DIFF_MIX)]
         expect = out_dir / "hdf5_files"
         already = list(expect.glob(f"{args.env_id}_ep{episode}_seed*.h5")) \
             if expect.exists() else []
@@ -200,7 +211,7 @@ def main():
         t0 = time.time()
         ok, used_seed, attempts = False, None, 0
         for attempt in range(args.max_attempts):
-            seed = args.base_seed + idx * 1000 + attempt
+            seed = args.base_seed + episode * 1000 + attempt
             attempts = attempt + 1
             try:
                 ok = run_one(args.env_id, episode, seed, difficulty, out_dir)
