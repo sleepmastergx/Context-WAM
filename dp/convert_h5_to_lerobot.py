@@ -65,6 +65,27 @@ def stats_of(arr):
     }
 
 
+def episode_order(names, extended):
+    """Group ordering -> parquet episode index.
+
+    Legacy (default) is plain alphabetical -- how the original 100-episode
+    conversion ran, so its parquet 0-99 mapping (episode_0, episode_1,
+    episode_10, ...) is load-bearing for everything derived from it (stage-1
+    runs, the fastwam cache). --extended-order keeps that exact alphabetical
+    block for groups numbered <100 and appends groups >=100 in numeric order,
+    so an extended h5 converts to: parquet 0-99 == the legacy conversion
+    bit-for-bit, parquet 100+ == the generated episodes in numeric order.
+    Plain alphabetical over 500 groups would interleave them (episode_1,
+    episode_10, episode_100, ...).
+    """
+    if not extended:
+        return sorted(names)
+    num = lambda n: int(n.split("_")[1])
+    official = sorted(n for n in names if num(n) < 100)
+    extra = sorted((n for n in names if num(n) >= 100), key=num)
+    return official + extra
+
+
 def convert_episode(args):
     (h5_path, ep_name, ep_index, global_start, out_dir, gripper_mode,
      task_index) = args
@@ -151,6 +172,10 @@ def main():
     p.add_argument("--out", required=True)
     p.add_argument("--workers", type=int, default=12)
     p.add_argument("--gripper-elem", default="mean", choices=["mean", "0", "1"])
+    p.add_argument("--extended-order", action="store_true",
+                   help="official episodes (<100) in legacy alphabetical "
+                        "order first, then generated (>=100) numerically; "
+                        "see episode_order()")
     p.add_argument("--verify", action="store_true",
                    help="after conversion, diff sampled frames vs the h5")
     args = p.parse_args()
@@ -165,7 +190,7 @@ def main():
     # single-goal task like MoveCube, wrong for VideoUnmask, where the goal
     # string carries the QUERY COLOR and 9 distinct strings appear.
     with h5py.File(args.h5, "r") as f:
-        ep_names = sorted(f.keys())
+        ep_names = episode_order(f.keys(), args.extended_order)
         lengths, ep_goals = [], []
         for n in ep_names:
             lengths.append(len([k for k in f[n].keys()
@@ -245,7 +270,7 @@ def verify(args):
     import pyarrow.parquet as pq
     rng = np.random.default_rng(0)
     with h5py.File(args.h5, "r") as f:
-        for i, n in enumerate(sorted(f.keys())):
+        for i, n in enumerate(episode_order(f.keys(), args.extended_order)):
             tbl = pq.read_table(
                 f"{args.out}/data/{CHUNK}/episode_{i:06d}.parquet")
             ts = sorted([k for k in f[n].keys() if k.startswith("timestep")],

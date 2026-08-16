@@ -67,6 +67,10 @@ def main():
     ap.add_argument("--no-vae", action="store_true",
                     help="enumerate windows and shapes only; no GPU needed")
     ap.add_argument("--limit-episodes", type=int, default=None)
+    ap.add_argument("--first-episode", type=int, default=0,
+                    help="skip episodes below this global index (extend an "
+                         "existing cache without re-encoding it; ep numbering "
+                         "stays global, so ep0100.npz still means episode 100)")
     ap.add_argument("--shard", type=int, default=0)
     ap.add_argument("--num-shards", type=int, default=1,
                     help="episode-sharded VAE pass; one process per GPU")
@@ -82,6 +86,7 @@ def main():
     if args.limit_episodes:
         files = files[:args.limit_episodes]
     all_files = list(files)
+    files = files[args.first_episode:]
     files = files[args.shard::args.num_shards]   # episodes are independent
     if not files:
         sys.exit(f"no parquets under {args.lerobot_root}")
