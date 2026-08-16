@@ -23,7 +23,7 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/env-dp.sh"
 [ -f /workspace/env-dp.sh ] && source /workspace/env-dp.sh
 cd "$REPO_ROOT"
 
-RUN_DIR=runs/dp_stage1
+RUN_DIR=${RUN_DIR:-runs/dp_stage1}
 LOGDIR=$RUN_DIR/eval_logs
 mkdir -p "$LOGDIR"
 
