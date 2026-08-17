@@ -20,7 +20,9 @@ import h5py
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--base", required=True)
+    ap.add_argument("--base", default=None,
+                    help="official h5 to copy first; omit for a standalone "
+                         "extension file (generated episodes only)")
     ap.add_argument("--extra-dir", required=True)
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
@@ -31,11 +33,12 @@ def main():
 
     seen = set()
     with h5py.File(args.out, "w") as out:
-        with h5py.File(args.base, "r") as base:
-            for name in sorted(base.keys(), key=lambda s: int(s.split("_")[1])):
-                base.copy(name, out)
-                seen.add(name)
-        print(f"copied {len(seen)} episodes from {args.base}")
+        if args.base:
+            with h5py.File(args.base, "r") as base:
+                for name in sorted(base.keys(), key=lambda s: int(s.split("_")[1])):
+                    base.copy(name, out)
+                    seen.add(name)
+            print(f"copied {len(seen)} episodes from {args.base}")
 
         n_extra = 0
         for path in extra_files:

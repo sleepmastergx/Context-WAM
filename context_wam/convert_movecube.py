@@ -71,6 +71,12 @@ def main():
                     help="skip episodes below this global index (extend an "
                          "existing cache without re-encoding it; ep numbering "
                          "stays global, so ep0100.npz still means episode 100)")
+    ap.add_argument("--episode-offset", type=int, default=0,
+                    help="add this to every episode id (npz name + index "
+                         "'ep'). For converting a STANDALONE extension "
+                         "dataset whose parquet 0..N-1 are global episodes "
+                         "offset..offset+N-1 (e.g. a generated-only LeRobot "
+                         "set extending an existing 100-episode cache).")
     ap.add_argument("--shard", type=int, default=0)
     ap.add_argument("--num-shards", type=int, default=1,
                     help="episode-sharded VAE pass; one process per GPU")
@@ -127,7 +133,7 @@ def main():
 
     index, n_win, n_exec = [], 0, 0
     for fp in files:
-        ep_i = all_files.index(fp)          # global episode id, shard-invariant
+        ep_i = all_files.index(fp) + args.episode_offset  # global episode id, shard-invariant
         df = pd.read_parquet(fp, columns=["image", "wrist_image", "state",
                                           "actions", "is_demo"])
         T = len(df)
