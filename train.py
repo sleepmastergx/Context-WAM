@@ -23,6 +23,7 @@ Synthetic CPU smoke (no accelerate, no weights, verifies the LOOP only):
     python train.py --arm ttt --synthetic --steps 3
 """
 import argparse
+import contextlib
 import json
 import os
 import pathlib
@@ -58,7 +59,11 @@ sys.path.insert(0, str(HERE / "context_wam"))
 
 from sliding_chain import SlidingChain          # noqa: E402
 
-ARM_CFG = {"control": "fastwam_ttt_m5_control", "ttt": "fastwam_ttt_m5"}
+ARM_CFG = {
+    "control": "fastwam_ttt_m5_control",
+    "ttt": "fastwam_ttt_m5",
+    "original": "fastwam_original_m30",
+}
 
 
 class EMA:
@@ -92,8 +97,12 @@ class ArmModule(torch.nn.Module):
         self.chain = None            # SlidingChain (not an nn.Module) or None
 
     def forward(self, batch, idx=None):
+        """idx: legacy path (chain rolled inside the forward, one chain per
+        micro-batch). main() now rolls the chain ONCE per optimizer step and
+        installs the readouts before each micro-batch (chain-once protocol),
+        so it calls forward(batch) with idx=None."""
         stats = None
-        if self.chain is not None:
+        if self.chain is not None and idx is not None:
             stats = self.chain.load_states(idx)   # in-graph; sets memory._m
         loss = self.model.training_loss(batch)
         if isinstance(loss, (tuple, list)):
@@ -185,22 +194,25 @@ def make_sched(opt, total_steps):
         milestones=[warmup])
 
 
-def save_ckpt(path, step, cfg, model, memory, ema):
+def save_ckpt(path, step, cfg, model_state, memory, ema):
     torch.save({"step": step, "cfg": cfg,
-                "model": model.state_dict(),
+                "model": model_state,
                 "memory": memory.state_dict() if memory is not None else None,
                 "ema": ema.state_dict() if ema is not None else None}, path)
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--arm", choices=("control", "ttt"), required=True)
+    ap.add_argument("--arm", choices=tuple(ARM_CFG), required=True)
     ap.add_argument("--config", default=str(HERE / "configs/train_movecube.yaml"))
     ap.add_argument("--cache", default=os.environ.get("CACHE_DIR"),
                     help="window cache dir; defaults to $CACHE_DIR "
                          "(set by setup.sh's env.sh)")
     ap.add_argument("--out", default=None)
     ap.add_argument("--steps", type=int, default=None, help="cap for smoke runs")
+    ap.add_argument("--resume", default=None,
+                    help="weights checkpoint to resume from; restores step and "
+                         "scheduler position (optimizer moments are not stored)")
     ap.add_argument("--synthetic", action="store_true",
                     help="CPU: fake data + stub model — verifies the LOOP only")
     args = ap.parse_args()
@@ -208,10 +220,32 @@ def main():
     cfg = yaml.safe_load(open(args.config))
     cfg["model"] = yaml.safe_load(
         open(HERE / f"configs/model/{ARM_CFG[args.arm]}.yaml"))
+    if "mot_checkpoint_mixed_attn" in cfg:
+        cfg["model"]["mot_checkpoint_mixed_attn"] = bool(
+            cfg["mot_checkpoint_mixed_attn"])
+    if "video_gradient_checkpointing" in cfg:
+        cfg["model"]["video_dit_config"]["use_gradient_checkpointing"] = bool(
+            cfg["video_gradient_checkpointing"])
+    if "action_gradient_checkpointing" in cfg:
+        cfg["model"]["action_dit_config"]["use_gradient_checkpointing"] = bool(
+            cfg["action_gradient_checkpointing"])
     is_ttt = args.arm == "ttt"
     if is_ttt != bool(cfg["model"].get("memory", {}).get("enabled", False)):
         raise SystemExit(f"--arm {args.arm} does not match memory.enabled in "
                          f"{ARM_CFG[args.arm]}.yaml — refusing to guess")
+    if args.resume:
+        cfg["resume_from"] = str(pathlib.Path(args.resume).resolve())
+
+    grad_accum = int(cfg.get("gradient_accumulation_steps", 1))
+    if grad_accum < 1:
+        raise SystemExit("gradient_accumulation_steps must be >= 1")
+
+    if torch.cuda.is_available():
+        torch.set_float32_matmul_precision(
+            cfg.get("float32_matmul_precision", "high"))
+        torch.backends.cuda.matmul.allow_tf32 = bool(cfg.get("allow_tf32", True))
+        torch.backends.cudnn.allow_tf32 = bool(cfg.get("allow_tf32", True))
+        torch.backends.cudnn.benchmark = bool(cfg.get("cudnn_benchmark", True))
 
     out = pathlib.Path(args.out or os.path.join(
         os.environ.get("OUT_ROOT", str(HERE / "runs")), f"fwam_{args.arm}"))
@@ -221,13 +255,18 @@ def main():
         accelerator, device, world, rank, is_main = None, torch.device("cpu"), 1, 0, True
     else:
         from accelerate import Accelerator
-        accelerator = Accelerator(mixed_precision=cfg.get("mixed_precision", "bf16"))
+        accelerator = Accelerator(
+            mixed_precision=cfg.get("mixed_precision", "bf16"),
+            gradient_accumulation_steps=grad_accum,
+        )
         device = accelerator.device
         world = accelerator.num_processes
         rank = accelerator.process_index
         is_main = accelerator.is_main_process
     if is_main:
         (out / "checkpoints").mkdir(parents=True, exist_ok=True)
+        with open(out / "run_config.yaml", "w") as fh:
+            yaml.safe_dump(cfg, fh, sort_keys=False)
 
     torch.manual_seed(cfg["seed"])
     np.random.seed(cfg["seed"])
@@ -242,15 +281,71 @@ def main():
         from gpu_cache import GPUWindowCache
         # first train_episodes episodes train; the rest are held out for val,
         # mirroring the DP split discipline
-        cache = GPUWindowCache(args.cache, device,
-                               split_episodes=list(range(cfg["train_episodes"])))
+        train_episodes = list(range(int(cfg["train_episodes"])))
+        excluded = {int(e) for e in cfg.get("exclude_train_episodes", [])}
+        train_episodes = [e for e in train_episodes if e not in excluded]
+        if not train_episodes:
+            raise SystemExit("training episode split is empty")
+        cache_storage_device = str(cfg.get("cache_storage_device", device))
+        # (the sliding chain moves its E x J inputs to the memory's device
+        # itself, so a CPU-resident cache is fine for the ttt arm too)
+        cache = GPUWindowCache(
+            args.cache,
+            device,
+            split_episodes=train_episodes,
+            storage_device=cache_storage_device,
+        )
     exec_idx = cache.exec_indices()
-    per_rank = max(1, cfg["batch_size"] // world)
-    steps_per_epoch = max(1, len(exec_idx) // (per_rank * world))
+    effective_batch = int(cfg["batch_size"])
+    batch_divisor = world * grad_accum
+    configured_micro = (None if args.synthetic
+                        else cfg.get("micro_batch_size_per_gpu"))
+    if configured_micro is None:
+        if effective_batch % batch_divisor:
+            raise SystemExit(
+                f"batch_size={effective_batch} must be divisible by "
+                f"world_size({world}) * gradient_accumulation_steps({grad_accum})")
+        per_rank = effective_batch // batch_divisor
+    else:
+        per_rank = int(configured_micro)
+        actual_batch = per_rank * batch_divisor
+        if actual_batch != effective_batch:
+            raise SystemExit(
+                f"batch_size={effective_batch}, but micro_batch_size_per_gpu="
+                f"{per_rank} * world_size={world} * gradient_accumulation_steps="
+                f"{grad_accum} gives {actual_batch}")
+    if per_rank < 1:
+        raise SystemExit("micro batch size per GPU must be >= 1")
+    steps_per_epoch = max(1, len(exec_idx) // effective_batch)
     total_steps = args.steps or steps_per_epoch * cfg["num_epochs"]
 
     # ---------------------------------------------------------------- model
     model, memory = build_arm(cfg, device, args.synthetic)
+    resume_step = 0
+    if args.resume:
+        resume_path = pathlib.Path(args.resume)
+        if not resume_path.is_file():
+            raise SystemExit(f"resume checkpoint not found: {resume_path}")
+        payload = torch.load(
+            resume_path, map_location="cpu", mmap=True, weights_only=False)
+        resume_step = int(payload["step"])
+        model.load_state_dict(payload["model"], strict=True)
+        if is_ttt and payload.get("memory") is not None:
+            memory.load_state_dict(payload["memory"], strict=True)
+        del payload
+        if is_main:
+            print(f"resumed weights from {resume_path} at step "
+                  f"{resume_step}; optimizer moments restart empty", flush=True)
+    if (accelerator is not None and
+            accelerator.distributed_type.name == "FSDP"):
+        # FastWAM registers each expert twice: directly as
+        # model.video_expert/action_expert and again under model.mot.mixtures.
+        # FSDP cannot recursively wrap the same Module object through two
+        # ownership paths. Keep the public attributes as non-registering
+        # aliases; mot.mixtures remains the single registered owner.
+        for expert_name in ("video_expert", "action_expert"):
+            expert = model._modules.pop(expert_name)
+            object.__setattr__(model, expert_name, expert)
     arm = ArmModule(model)
     if is_ttt:
         if memory is None:
@@ -265,9 +360,37 @@ def main():
         groups = trainable_parameters(model, None)     # model only; memory below
         if memory is not None:
             memory.requires_grad_(True)
-    opt = torch.optim.AdamW(groups, lr=cfg["learning_rate"], betas=(0.9, 0.95),
-                            weight_decay=cfg["weight_decay"])
+    fused_opt = bool(cfg.get("fused_optimizer", False) and device.type == "cuda")
+    use_torch_zro = bool(
+        cfg.get("zero_redundancy_optimizer", False)
+        and accelerator is not None
+        and accelerator.distributed_type.name == "MULTI_GPU"
+    )
+    if use_torch_zro:
+        from torch.distributed.optim import ZeroRedundancyOptimizer
+        opt = ZeroRedundancyOptimizer(
+            groups,
+            optimizer_class=torch.optim.AdamW,
+            lr=cfg["learning_rate"],
+            betas=(0.9, 0.95),
+            weight_decay=cfg["weight_decay"],
+            fused=fused_opt,
+        )
+    else:
+        opt = torch.optim.AdamW(
+            groups,
+            lr=cfg["learning_rate"],
+            betas=(0.9, 0.95),
+            weight_decay=cfg["weight_decay"],
+            fused=fused_opt,
+        )
     sched = make_sched(opt, total_steps)
+    if resume_step:
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            for _ in range(resume_step):
+                sched.step()
 
     mem_opt = mem_sched = None
     if memory is not None:
@@ -278,9 +401,17 @@ def main():
         else:
             from build_model import memory_param_groups
             mem_groups = memory_param_groups(memory)
-        mem_opt = torch.optim.AdamW(mem_groups, lr=cfg["learning_rate"],
-                                    betas=(0.9, 0.95),
-                                    weight_decay=cfg["weight_decay"])
+        # gradient accumulation: the chain runs once per optimizer step and
+        # its readouts are handed to each micro-batch as detached leaves whose
+        # grads accumulate; ONE chain backward then moves the summed gradient
+        # into the write parameters (exact — see the loop below)
+        mem_opt = torch.optim.AdamW(
+            mem_groups,
+            lr=cfg["learning_rate"],
+            betas=(0.9, 0.95),
+            weight_decay=cfg["weight_decay"],
+            fused=fused_opt,
+        )
         mem_sched = make_sched(mem_opt, total_steps)
 
     # ---------------------------------------------------------- accelerate
@@ -288,14 +419,42 @@ def main():
         dsp = getattr(accelerator.state, "deepspeed_plugin", None)
         if dsp is not None:
             dsp.deepspeed_config["train_micro_batch_size_per_gpu"] = per_rank
-            dsp.deepspeed_config["gradient_accumulation_steps"] = 1
-            dsp.deepspeed_config["train_batch_size"] = per_rank * world
+            dsp.deepspeed_config["gradient_accumulation_steps"] = grad_accum
+            dsp.deepspeed_config["train_batch_size"] = effective_batch
             dsp.deepspeed_config["gradient_clipping"] = cfg["max_grad_norm"]
-        arm, opt, sched = accelerator.prepare(arm, opt, sched)
+            if cfg.get("deepspeed_wall_clock_breakdown", False):
+                dsp.deepspeed_config["wall_clock_breakdown"] = True
+                dsp.deepspeed_config["steps_per_print"] = 1
+        if use_torch_zro:
+            # Accelerate's optimizer wrapper calls state_dict() during
+            # construction, which ZeroRedundancyOptimizer intentionally rejects
+            # before an explicit cross-rank consolidation. Keep the native
+            # optimizer/scheduler and prepare only the DDP model.
+            arm = accelerator.prepare_model(arm)
+        else:
+            arm, opt, sched = accelerator.prepare(arm, opt, sched)
         raw = accelerator.unwrap_model(arm)
     else:
         dsp = None
         raw = arm
+
+    if is_main:
+        optimizer_chain = []
+        current_opt = opt
+        seen_optimizers = set()
+        while current_opt is not None and id(current_opt) not in seen_optimizers:
+            seen_optimizers.add(id(current_opt))
+            defaults = getattr(current_opt, "defaults", {})
+            fused = defaults.get("fused") if isinstance(defaults, dict) else None
+            details = []
+            if fused is not None:
+                details.append(f"fused={fused}")
+            if hasattr(current_opt, "clip_grad"):
+                details.append(f"clip_grad={current_opt.clip_grad}")
+            suffix = f"({', '.join(details)})" if details else ""
+            optimizer_chain.append(type(current_opt).__name__ + suffix)
+            current_opt = getattr(current_opt, "optimizer", None)
+        print("optimizer=" + " -> ".join(optimizer_chain), flush=True)
 
     tracked = [(f"model.{n}", p) for n, p in raw.model.named_parameters()
                if p.requires_grad]
@@ -310,7 +469,8 @@ def main():
     if is_main:
         print(f"arm={args.arm} | trainable {n_tr/1e6:.2f}M "
               f"(memory {sum(p.numel() for p in mem_params)/1e6:.2f}M) | "
-              f"{len(exec_idx)} exec windows | batch {per_rank}/rank x {world} "
+              f"{len(exec_idx)} exec windows | micro batch {per_rank}/rank x "
+              f"{world} x accum {grad_accum} = {effective_batch} "
               f"| {steps_per_epoch} steps/epoch -> {total_steps} steps", flush=True)
 
     wb = None
@@ -331,51 +491,171 @@ def main():
             print(f"wandb disabled ({e})", flush=True)
 
     # ---------------------------------------------------------------- loop
-    g = torch.Generator(device="cpu").manual_seed(cfg["seed"] + rank)
+    # Sampling: ALL micro-batches of an optimizer step are drawn at once
+    # (per_rank * grad_accum windows) so the memory chain can be rolled once
+    # per step over their union; for grad_accum == 1 this is the historical
+    # draw, so control/ttt pairs stay window-identical.
+    #
+    # Chain-once protocol (memory arm):
+    #   ms, stats = chain.readouts(sel_all)          # in-graph, once per step
+    #   leaves    = [m.detach().requires_grad_()]    # what the DiT sees
+    #   for each micro-batch k:  memory._m = leaves[k-th slice]; loss_k.backward()
+    #       -> d loss_k / d leaf accumulates on the leaves (scaled 1/accum by
+    #          accelerate like every other grad)
+    #   torch.autograd.backward(ms, [leaf.grad])     # ONE chain backward:
+    #       sum_k dloss_k/dm_k * dm_k/dtheta == d(sum_k loss_k)/dtheta, exact.
+    # The chain graph is therefore built once and traversed once per step,
+    # whatever grad_accum is; the 5B DiT graph is still per micro-batch.
+    g = torch.Generator(device="cpu").manual_seed(
+        cfg["seed"] + rank + resume_step)
     t0 = time.time()
-    for gstep in range(1, total_steps + 1):
-        sel = exec_idx[torch.randint(len(exec_idx), (per_rank,), generator=g)
-                       .to(exec_idx.device)]
-        batch = cache.batch(sel)
+    timing_steps = int(cfg.get("timing_steps", 0))
+    gstep = resume_step
+    chain = raw.chain if memory is not None else None
+    opt.zero_grad(set_to_none=True)
+    if mem_opt is not None:
+        mem_opt.zero_grad(set_to_none=True)
+    while gstep < total_steps:
+        timing_events = None
+        if (is_main and torch.cuda.is_available() and
+                gstep < timing_steps):
+            timing_events = {
+                name: torch.cuda.Event(enable_timing=True)
+                for name in ("data_start", "data_end", "forward_end",
+                             "backward_end", "optimizer_end")
+            }
+            timing_events["data_start"].record()
+        sel_all = exec_idx[torch.randint(len(exec_idx),
+                                         (per_rank * grad_accum,),
+                                         generator=g).to(exec_idx.device)]
 
-        opt.zero_grad(set_to_none=True)
-        if mem_opt is not None:
-            mem_opt.zero_grad(set_to_none=True)
+        # ---- memory chain: once per optimizer step, in-graph -----------
+        stats, ms, leaves = None, None, None
+        if chain is not None:
+            ms, stats = chain.readouts(sel_all)           # list of [B_all, d_out]
+            leaves = [m.detach().requires_grad_(True) for m in ms]
 
-        loss, stats = arm(batch, sel)
-        if accelerator is not None:
-            accelerator.backward(loss)
-        else:
-            loss.backward()
+        accumulated_loss = 0.0
+        engine_grad_norm = None
+        for k in range(grad_accum):
+            sel = sel_all[k * per_rank:(k + 1) * per_rank]
+            batch = cache.batch(sel)
+            if timing_events is not None and k == 0:
+                timing_events["data_end"].record()
+            if leaves is not None:
+                chain.set_readouts(
+                    [leaf[k * per_rank:(k + 1) * per_rank] for leaf in leaves])
 
-        # memory params live outside the engine: reduce + clip + step manually
-        mem_gnorm = 0.0
-        if memory is not None:
-            if accelerator is not None and world > 1:
-                for p in mem_params:
-                    if p.grad is not None:
-                        p.grad = accelerator.reduce(p.grad, reduction="mean")
-            mem_gnorm = float(torch.nn.utils.clip_grad_norm_(
-                mem_params, cfg["max_grad_norm"]))
-            mem_opt.step()
-            mem_sched.step()
-        if dsp is None:
-            # DeepSpeed clips engine grads itself (gradient_clipping above)
-            clip = [p for _, p in tracked if not _.startswith("memory.")]
-            if accelerator is not None:
-                accelerator.clip_grad_norm_(clip, cfg["max_grad_norm"])
-            else:
-                torch.nn.utils.clip_grad_norm_(clip, cfg["max_grad_norm"])
-        opt.step()
-        sched.step()
+            accumulate = (accelerator.accumulate(arm) if accelerator is not None
+                          else contextlib.nullcontext())
+            with accumulate:
+                loss, _ = arm(batch)
+                if timing_events is not None and k == grad_accum - 1:
+                    timing_events["forward_end"].record()
+                if not bool(torch.isfinite(loss.detach())):
+                    raise FloatingPointError(
+                        f"non-finite loss before backward at optimizer step "
+                        f"{gstep + 1}, rank {rank}")
+                accumulated_loss += float(loss.detach())
+                sync_gradients = (accelerator.sync_gradients
+                                  if accelerator is not None
+                                  else k == grad_accum - 1)
+                if accelerator is not None:
+                    accelerator.backward(loss)      # scales by 1/grad_accum
+                    if dsp is not None and sync_gradients:
+                        engine_grad_norm = (
+                            accelerator.deepspeed_engine_wrapped.get_global_grad_norm())
+                else:
+                    (loss / grad_accum).backward()
+                if k == grad_accum - 1 and not sync_gradients:
+                    raise RuntimeError(
+                        "accelerate's accumulation counter is out of phase with "
+                        "the optimizer-step loop (grad_accum mismatch)")
+                if timing_events is not None and k == grad_accum - 1:
+                    timing_events["backward_end"].record()
+
+                # memory params live outside the engine: one chain backward
+                # with the accumulated readout grads, then reduce + clip + step
+                mem_gnorm = 0.0
+                if memory is not None and sync_gradients:
+                    grads = [leaf.grad if leaf.grad is not None
+                             else torch.zeros_like(leaf) for leaf in leaves]
+                    torch.autograd.backward(ms, grads)
+                    if accelerator is not None and world > 1:
+                        for p in mem_params:
+                            if p.grad is not None:
+                                p.grad = accelerator.reduce(p.grad, reduction="mean")
+                    mem_gnorm = float(torch.nn.utils.clip_grad_norm_(
+                        mem_params, cfg["max_grad_norm"]))
+                    mem_opt.step()
+                    mem_sched.step()
+                    mem_opt.zero_grad(set_to_none=True)
+                    ms = leaves = None
+                if dsp is None and sync_gradients:
+                    # DeepSpeed clips engine grads itself (gradient_clipping above)
+                    if (accelerator is not None and
+                            accelerator.distributed_type.name == "FSDP"):
+                        accelerator.clip_grad_norm_(
+                            arm.parameters(), cfg["max_grad_norm"])
+                    else:
+                        clip = [p for _, p in tracked
+                                if not _.startswith("memory.")]
+                    if accelerator is not None and accelerator.distributed_type.name != "FSDP":
+                        accelerator.clip_grad_norm_(clip, cfg["max_grad_norm"])
+                    elif accelerator is None:
+                        torch.nn.utils.clip_grad_norm_(clip, cfg["max_grad_norm"])
+                if sync_gradients:
+                    opt.step()
+                    sched.step()
+                    opt.zero_grad(set_to_none=True)
+                if timing_events is not None and k == grad_accum - 1:
+                    timing_events["optimizer_end"].record()
+
+        gstep += 1
+        step_loss = accumulated_loss / grad_accum
         if ema is not None:
             ema.update(tracked_params)
 
+        if not args.synthetic and bool(cfg.get("fail_on_nonfinite", True)):
+            probes = {
+                "video.patch_embedding": raw.model.video_expert.patch_embedding.weight,
+                "action.action_encoder": raw.model.action_expert.action_encoder.weight,
+            }
+            bad_probes = [
+                name for name, value in probes.items()
+                if not bool(torch.isfinite(value.detach()).all())
+            ]
+            if bad_probes:
+                raise FloatingPointError(
+                    f"non-finite parameters after optimizer step {gstep}, rank "
+                    f"{rank}: {', '.join(bad_probes)}")
+
+        step_timing = None
+        if timing_events is not None:
+            timing_events["optimizer_end"].synchronize()
+            step_timing = {
+                "data_ms": timing_events["data_start"].elapsed_time(
+                    timing_events["data_end"]),
+                "forward_ms": timing_events["data_end"].elapsed_time(
+                    timing_events["forward_end"]),
+                "backward_ms": timing_events["forward_end"].elapsed_time(
+                    timing_events["backward_end"]),
+                "optimizer_ms": timing_events["backward_end"].elapsed_time(
+                    timing_events["optimizer_end"]),
+            }
+
         if is_main and (gstep % cfg["log_every"] == 0 or gstep == 1):
-            rec = {"step": gstep, "loss": float(loss.detach()),
+            rec = {"step": gstep, "loss": step_loss,
                    "lr": sched.get_last_lr()[0],
-                   "steps_per_s": gstep / max(time.time() - t0, 1e-9)}
+                   "steps_per_s": ((gstep - resume_step)
+                                   / max(time.time() - t0, 1e-9))}
+            if engine_grad_norm is not None:
+                rec["grad_norm"] = float(engine_grad_norm)
+            if step_timing is not None:
+                rec.update(step_timing)
             if torch.cuda.is_available():
+                rec["vram_current_gib"] = (
+                    torch.cuda.memory_allocated() / 2**30)
                 rec["vram_gib"] = torch.cuda.max_memory_allocated() / 2**30
             if memory is not None:
                 rec["gate"] = float(torch.tanh(memory.alpha).abs().mean())
@@ -389,9 +669,29 @@ def main():
             if wb is not None:
                 wb.log({k: v for k, v in rec.items() if k != "step"}, step=gstep)
 
-        if is_main and (gstep % cfg["save_every"] == 0 or gstep == total_steps):
+        save_every = int(cfg.get("save_every", 0))
+        should_save = (
+            (save_every > 0 and gstep % save_every == 0)
+            or (bool(cfg.get("save_final", True)) and gstep == total_steps)
+        )
+        if should_save and accelerator is not None:
+            accelerator.wait_for_everyone()
+        model_state = None
+        if should_save and accelerator is not None and \
+                accelerator.distributed_type.name == "FSDP":
+            arm_state = accelerator.get_state_dict(arm)
+            if is_main:
+                model_state = {
+                    (name[len("model."):] if name.startswith("model.") else name): value
+                    for name, value in arm_state.items()
+                }
+        elif is_main and should_save:
+            model_state = raw.model.state_dict()
+        if is_main and should_save:
             save_ckpt(out / "checkpoints" / f"step_{gstep}.pt",
-                      gstep, cfg, raw.model, memory, ema)
+                      gstep, cfg, model_state, memory, ema)
+        if should_save and accelerator is not None:
+            accelerator.wait_for_everyone()
 
     if is_main:
         print(f"done: {total_steps} steps in {time.time()-t0:.0f}s", flush=True)

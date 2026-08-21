@@ -89,6 +89,27 @@ CACHE_DIR=data/movecube_fastwam bash scripts/launch_ttt.sh
 # Slurm: sbatch --export=ALL,ARM=ttt,CACHE_DIR=... scripts/slurm_example.sbatch
 ```
 
+### Original Fast-WAM 30/30 on the 500-episode cache
+
+The equal-depth original MoT path (30 video layers + 30 action layers, no TTT
+memory and no fused-KV routing) has a dedicated two-H100 launcher:
+
+```bash
+CACHE_DIR=/workspace/datasets/movecube-fastwam-cache \
+  bash scripts/launch_original_30x30.sh
+```
+
+It trains for 30 epochs on episodes 0-89 and 100-499, preserving official
+validation episodes 90-99. The effective global batch is 32 (micro-batch 4 per
+GPU with 4-step accumulation), the full cache stays in host RAM, and
+native PyTorch DDP plus `ZeroRedundancyOptimizer` shards optimizer state over
+the two NVLink GPUs without DeepSpeed.
+Checkpoints and logs go to
+`/workspace/outputs/fastwam_original_30x30_ddp` by default. After a successful
+30-epoch exit, the launcher uploads that complete run to the private model repo
+`SleepMastger/movecube-fastwam-original-30x30` (override with
+`HF_UPLOAD_REPO`, or set `HF_UPLOAD_ENABLED=0` to disable).
+
 ~5B params train (their recipe: both experts + proprio encoder), so the
 launchers use **DeepSpeed ZeRO-1** via accelerate — replicated AdamW state
 alone is 56 GiB and will not fit without it. The TTT memory stays **outside**

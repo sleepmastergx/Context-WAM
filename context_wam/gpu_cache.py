@@ -1,10 +1,10 @@
-"""Latent cache resident in VRAM. Removes the dataloader from the step loop.
+"""Contiguous latent cache with optional VRAM or host-RAM residency.
 
-The whole MoveCube cache is ~5.7 GiB bf16 (41.7k windows x [48,3,16,32]) — it
-fits many times over in an H200's 141 GiB, so every rank holds the full copy and
-batches are gathered on-device. Same move that made stage-2 fast (28.7 MiB
-there); here it is the difference between a PNG/parquet read per window and a
-pure index_select.
+The original 100-episode MoveCube cache is ~5.7 GiB bf16 (41.7k windows x
+[48,3,16,32]) and can be gathered directly in VRAM. The 500-episode extension
+is kept in host RAM for 80 GiB cards and only each micro batch moves to the
+training GPU. Both modes avoid PNG/parquet or compressed-NPZ reads in the step
+loop.
 
 VRAM accounting per rank (bf16):
     latents      5.7 GiB   resident, read-only
@@ -36,7 +36,14 @@ class GPUWindowCache:
                                and action_horizon % (T-1) == 0 (32 % 8 ok).
     """
 
-    def __init__(self, root: str, device, split_episodes=None, dtype=torch.bfloat16):
+    def __init__(
+        self,
+        root: str,
+        device,
+        split_episodes=None,
+        dtype=torch.bfloat16,
+        storage_device=None,
+    ):
         metas = sorted(glob.glob(f"{root}/meta*.json"))
         if not metas:
             raise FileNotFoundError(f"no meta*.json under {root} — run the conversion")
@@ -47,6 +54,7 @@ class GPUWindowCache:
             index.extend(d["index"])
         self.meta = meta
         self.device = torch.device(device)
+        self.storage_device = torch.device(storage_device or device)
 
         eps = sorted({r["ep"] for r in index})
         if split_episodes is not None:
@@ -71,12 +79,12 @@ class GPUWindowCache:
             is_exec.append(torch.from_numpy(
                 (starts >= int(z["exec_start"])).astype(np.bool_)))
 
-        self.latents = torch.cat(lat).to(self.device)
-        self.actions = torch.cat(act).to(self.device)
-        self.states = torch.cat(sta).to(self.device)
-        self.ep = torch.cat(ep_id).to(self.device)
-        self.start = torch.cat(start).to(self.device)
-        self.is_exec = torch.cat(is_exec).to(self.device)
+        self.latents = torch.cat(lat).to(self.storage_device)
+        self.actions = torch.cat(act).to(self.storage_device)
+        self.states = torch.cat(sta).to(self.storage_device)
+        self.ep = torch.cat(ep_id).to(self.storage_device)
+        self.start = torch.cat(start).to(self.storage_device)
+        self.is_exec = torch.cat(is_exec).to(self.storage_device)
         # Text context. MoveCube: ONE goal shared by every window. VideoUnmask:
         # the goal names the query color, so the context is per EPISODE and is
         # gathered per window — sharing one context there would make the model
@@ -89,8 +97,10 @@ class GPUWindowCache:
         tp = torch.load(tpath, map_location="cpu")
         self.per_episode_text = "contexts" in tp
         if self.per_episode_text:
-            self.contexts = tp["contexts"].to(self.device, dtype)  # [K, L, 4096]
-            self.context_masks = tp["masks"].to(self.device)       # [K, L] bool
+            self.contexts = tp["contexts"].to(
+                self.storage_device, dtype)  # [K, L, 4096]
+            self.context_masks = tp["masks"].to(
+                self.storage_device)       # [K, L] bool
             ep_task = {int(k): int(v) for k, v in tp["ep_task"].items()}
             missing = keep - set(ep_task)
             if missing:
@@ -100,21 +110,25 @@ class GPUWindowCache:
             # per-window goal id, so batch() is one index_select like the rest
             self.win_task = torch.tensor(
                 [ep_task[int(e)] for e in self.ep.tolist()],
-                dtype=torch.long, device=self.device)
+                dtype=torch.long, device=self.storage_device)
             self.context = self.context_mask = None
         else:
-            self.context = tp["context"].to(self.device, dtype)   # [L, 4096]
-            self.context_mask = tp["mask"].to(self.device)        # [L] bool
+            self.context = tp["context"].to(
+                self.storage_device, dtype)   # [L, 4096]
+            self.context_mask = tp["mask"].to(
+                self.storage_device)        # [L] bool
         C, T, H, W = 3, 9, 256, 512
         assert T % 4 == 1 and H % 16 == 0 and W % 16 == 0
-        self.source_video_shape = torch.tensor([[C, T, H, W]], device=self.device)
+        self.source_video_shape = torch.tensor(
+            [[C, T, H, W]], device=self.storage_device)
 
         n_bytes = sum(t.numel() * t.element_size() for t in
                       (self.latents, self.actions, self.states))
         txt = (f"{len(self.contexts)} per-episode goals"
                if self.per_episode_text else "1 shared goal")
         print(f"[GPUWindowCache] {len(self.latents)} windows from {len(eps)} "
-              f"episodes, {n_bytes/2**30:.2f} GiB resident on {self.device} "
+              f"episodes, {n_bytes/2**30:.2f} GiB resident on "
+              f"{self.storage_device} (batches -> {self.device}) "
               f"({int(self.is_exec.sum())} exec, {txt})", flush=True)
 
     def __len__(self):
@@ -124,7 +138,8 @@ class GPUWindowCache:
         return torch.nonzero(self.is_exec, as_tuple=False).squeeze(-1)
 
     def batch(self, idx):
-        """Gather on-device; no host round-trip."""
+        """Gather from the cache and move only the batch to the training GPU."""
+        idx = idx.to(self.storage_device)
         B = idx.shape[0]
         if self.per_episode_text:
             t = self.win_task[idx]
@@ -132,15 +147,22 @@ class GPUWindowCache:
         else:
             ctx = self.context.unsqueeze(0).expand(B, -1, -1)
             ctx_mask = self.context_mask.unsqueeze(0).expand(B, -1)
-        return {"video_latents": self.latents[idx],
-                "action": self.actions[idx],
+
+        def on_device(tensor):
+            if tensor.device == self.device:
+                return tensor
+            return tensor.to(self.device, non_blocking=tensor.is_pinned())
+
+        return {"video_latents": on_device(self.latents[idx]),
+                "action": on_device(self.actions[idx]),
                 # [B,1,P], not [B,P]: their build_inputs demands a 3D
                 # [B,T,d] proprio and then takes `proprio[:, 0, :]`. One state
                 # per window IS T=1, so this is a reshape, not a change of
                 # meaning. `self.states` stays 2D — SlidingChain indexes it
                 # directly as [E,J,P].
-                "proprio": self.states[idx].unsqueeze(1),
-                "is_exec": self.is_exec[idx],
-                "context": ctx,
-                "context_mask": ctx_mask,
-                "source_video_shape": self.source_video_shape.expand(B, -1)}
+                "proprio": on_device(self.states[idx].unsqueeze(1)),
+                "is_exec": on_device(self.is_exec[idx]),
+                "context": on_device(ctx),
+                "context_mask": on_device(ctx_mask),
+                "source_video_shape": on_device(
+                    self.source_video_shape.expand(B, -1))}

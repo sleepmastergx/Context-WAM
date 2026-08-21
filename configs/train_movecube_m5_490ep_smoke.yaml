@@ -1,0 +1,60 @@
+# M5 Fast-WAM (30-layer video / 5-layer action, fused_mlp KV) on the FULL
+# 490-episode MoveCube cache with the recipe validated by the original-30x30
+# run. BOTH arms read this file; `--arm ttt` / `--arm control` picks
+# configs/model/fastwam_ttt_m5{_control}.yaml (check_arms_match.py asserts the
+# pair differs only in `memory:`). Same seed + same window draws => clean
+# McNemar pair; run both arms with identical settings here.
+train_episodes: 12
+exclude_train_episodes: [90, 91, 92, 93, 94, 95, 96, 97, 98, 99]
+
+# Effective global batch = micro batch * GPUs * gradient accumulation.
+# (4 * 2 * 4 = 32, the measured optimum for the 30x30 run on 2x NVLink H100.)
+batch_size: 32
+micro_batch_size_per_gpu: 4
+gradient_accumulation_steps: 4
+num_epochs: 30
+
+learning_rate: 1.0e-4
+weight_decay: 1.0e-6      # memory `alpha` gets weight_decay 0 (must grow)
+max_grad_norm: 1.0
+mixed_precision: bf16     # the 5B engine only — the TTT memory is ALWAYS fp32
+seed: 42                  # IDENTICAL for both arms
+
+# Full 490-episode cache: too large to replicate beside the model on 80 GiB
+# GPUs. Host RAM + per-micro-batch transfer; the sliding chain likewise pulls
+# only its E x J chain inputs to the GPU each optimizer step.
+cache_storage_device: cpu
+
+# H100 recipe carried over from the original-30x30 run.
+fused_optimizer: false
+zero_redundancy_optimizer: true
+allow_tf32: true
+float32_matmul_precision: high
+cudnn_benchmark: true
+mot_checkpoint_mixed_attn: false
+video_gradient_checkpointing: false
+action_gradient_checkpointing: false
+
+# ---- sliding memory (ttt arm only) --------------------------------------
+sliding_w: 8              # settled 2026-08-11; w=16 is the fallback lever if
+                          # chain BPTT (depth ~62) misbehaves — watch mem_gnorm
+chain_checkpoint_every: 8 # the chain is rolled once per optimizer step over
+                          # per_rank*accum = 16 windows (E up to 16 episodes);
+                          # unsegmented that is ~20 GiB of chain activations
+                          # next to the model. Segments of 8 writes keep EXACT
+                          # gradients (torch.utils.checkpoint) at ~1/8 the
+                          # activation VRAM for one extra chain forward.
+
+log_every: 1
+save_every: 50
+save_final: true
+
+ema:
+  enabled: false          # fp32 shadows (~10 GiB/rank for 5B) do not fit
+  decay: 0.9999           # beside ZeRO state on 80 GiB cards
+
+wandb:
+  enabled: false
+  project: wam-ttt
+  group: movecube-fastwam-m5-490ep
+  tags: [fastwam, movecube, m5, 490ep]   # train.py appends the arm

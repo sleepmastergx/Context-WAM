@@ -1,0 +1,42 @@
+# Short real-model smoke/VRAM benchmark for two H100s.
+train_episodes: 8
+exclude_train_episodes: []
+batch_size: 32
+micro_batch_size_per_gpu: 4
+gradient_accumulation_steps: 4
+num_epochs: 1
+
+learning_rate: 1.0e-4
+weight_decay: 1.0e-6
+max_grad_norm: 1.0
+mixed_precision: bf16
+seed: 42
+cache_storage_device: cpu
+
+fused_optimizer: false
+zero_redundancy_optimizer: true
+allow_tf32: true
+float32_matmul_precision: high
+cudnn_benchmark: true
+mot_checkpoint_mixed_attn: false
+video_gradient_checkpointing: false
+action_gradient_checkpointing: false
+deepspeed_wall_clock_breakdown: true
+
+sliding_w: 8
+chain_checkpoint_every: 0
+log_every: 1
+save_every: 0
+save_final: false
+timing_steps: 2
+
+ema:
+  enabled: false
+  decay: 0.9999
+
+wandb:
+  enabled: false
+  project: wam-original
+  group: movecube-fastwam-30x30-smoke
+  tags: [fastwam, original, movecube, 30x30, smoke]
+hows 

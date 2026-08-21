@@ -161,3 +161,112 @@ def ttt_with_state(cell: TTTMemory, x, mask, state=None):
 def detach_state(state):
     """Truncated BPTT boundary: carry the values, cut the graph."""
     return None if state is None else tuple(t.detach() for t in state)
+
+
+# ---------------------------------------------------------------------------
+# Batched-over-cells variant (2026-08-19). The sliding chain runs one chain per
+# memory layer; looping over L cells serialises L x J x T tiny kernels and was
+# the chain's wall-clock bottleneck. This runs all L cells in ONE loop with a
+# leading cell axis on every slow weight. torch.stack keeps the graph, so each
+# cell's parameters receive exactly the gradient the looped version gives
+# (checks/check_sliding_chain.py test 5 asserts this to 1e-5).
+# ---------------------------------------------------------------------------
+def stack_cells(cells):
+    """Stack the slow weights of L identical-shape TTTMemory cells -> dict of
+    tensors with a leading L axis (in-graph views of the parameters)."""
+    c0 = cells[0]
+    for c in cells[1:]:
+        if c.chunk != c0.chunk or c.max_write != c0.max_write:
+            raise ValueError("stacked cells must share chunk and max_write")
+    st = lambda f: torch.stack([f(c) for c in cells])     # noqa: E731
+    return {
+        "ln_in_w": st(lambda c: c.ln_in.weight), "ln_in_b": st(lambda c: c.ln_in.bias),
+        "ln_in_eps": c0.ln_in.eps,
+        "Wk": st(lambda c: c.to_k.weight), "bk": st(lambda c: c.to_k.bias),
+        "Wv": st(lambda c: c.to_v.weight), "bv": st(lambda c: c.to_v.bias),
+        "Wq": st(lambda c: c.to_q.weight), "bq": st(lambda c: c.to_q.bias),
+        "We": st(lambda c: c.to_eta.weight[0]), "be": st(lambda c: c.to_eta.bias[0]),
+        "Wa": st(lambda c: c.to_alpha.weight[0]), "ba": st(lambda c: c.to_alpha.bias[0]),
+        "beta_logit": st(lambda c: c.beta_logit),
+        "W1_0": st(lambda c: c.W1_0), "W2_0": st(lambda c: c.W2_0),
+        "Wr": st(lambda c: c.readout.weight), "br": st(lambda c: c.readout.bias),
+        "ln_w": st(lambda c: c.ln.weight), "ln_b": st(lambda c: c.ln.bias),
+        "ln_eps": c0.ln.eps,
+        "chunk": int(c0.chunk), "max_write": float(c0.max_write),
+    }
+
+
+def stacked_init_state(P, E):
+    """Learned init broadcast to E episodes: (W1, W2, M1, M2), each [L,E,...]."""
+    W1 = P["W1_0"].unsqueeze(1).expand(-1, E, -1, -1)
+    W2 = P["W2_0"].unsqueeze(1).expand(-1, E, -1, -1)
+    return W1, W2, torch.zeros_like(W1), torch.zeros_like(W2)
+
+
+def _gelu_grad(x):
+    cdf = 0.5 * (1.0 + torch.erf(x / 2.0**0.5))
+    pdf = torch.exp(-0.5 * x * x) / (2.0 * torch.pi) ** 0.5
+    return cdf + x * pdf
+
+
+def ttt_with_state_stacked(P, x, mask, state):
+    """`ttt_with_state` for L cells at once.
+
+    P     : stack_cells(...) output
+    x     : [E, T, d_in]   the SAME input for every cell (pooled latents)
+    mask  : [E, T]
+    state : (W1, W2, M1, M2) each [L, E, ...]  (see stacked_init_state)
+    returns m [L, E, T, d_out], surprise [L, E, T], new state
+    """
+    import torch.nn.functional as F
+
+    L = P["W1_0"].shape[0]
+    E, T, _ = x.shape
+    xn = F.layer_norm(x, x.shape[-1:], eps=P["ln_in_eps"])             # [E,T,d]
+    xn = xn.unsqueeze(0) * P["ln_in_w"][:, None, None] + P["ln_in_b"][:, None, None]
+    K = torch.einsum("letd,lkd->letk", xn, P["Wk"]) + P["bk"][:, None, None]
+    V = torch.einsum("letd,lvd->letv", xn, P["Wv"]) + P["bv"][:, None, None]
+    Q = torch.einsum("letd,lkd->letk", xn, P["Wq"]) + P["bq"][:, None, None]
+    eta = F.softplus(torch.einsum("letd,ld->let", xn, P["We"]) + P["be"][:, None, None])
+    alpha = torch.sigmoid(torch.einsum("letd,ld->let", xn, P["Wa"]) + P["ba"][:, None, None])
+    beta = torch.sigmoid(P["beta_logit"]).view(L, 1, 1, 1)
+    W1, W2, M1, M2 = state
+    chunk, max_write = P["chunk"], P["max_write"]
+
+    outs, surprises = [], []
+    for s in range(0, T, chunk):
+        e = min(s + chunk, T)
+        kc, vc, qc = K[:, :, s:e], V[:, :, s:e], Q[:, :, s:e]            # [L,E,C,*]
+        mc = mask[:, s:e]                                                 # [E,C]
+
+        preq = torch.einsum("lehk,letk->leth", W1, qc)
+        mq = torch.einsum("levh,leth->letv", W2, F.gelu(preq))
+        outs.append(torch.einsum("letv,lov->leto", mq, P["Wr"]) + P["br"][:, None, None])
+
+        pre = torch.einsum("lehk,letk->leth", W1, kc)
+        h = F.gelu(pre)
+        y = torch.einsum("levh,leth->letv", W2, h)
+        err = y - vc
+        dY = 2.0 * err
+        dH = torch.einsum("levh,letv->leth", W2, dY)
+        dPre = dH * _gelu_grad(pre)
+
+        w = (eta[:, :, s:e] * mc).unsqueeze(-1)                           # [L,E,C,1]
+        denom = mc.sum(dim=1).clamp(min=1.0).view(1, E, 1, 1)
+        g1 = torch.einsum("leth,letk->lehk", dPre * w, kc) / denom
+        g2 = torch.einsum("letv,leth->levh", dY * w, h) / denom
+        gn = (g1.flatten(2).pow(2).sum(2) + g2.flatten(2).pow(2).sum(2) + 1e-12).sqrt()
+        scale = (max_write / gn).clamp(max=1.0).view(L, E, 1, 1)
+        g1, g2 = g1 * scale, g2 * scale
+        surprises.append(((err.pow(2).sum(-1)) * mc).detach())            # [L,E,C]
+
+        a = (alpha[:, :, s:e] * mc).mean(dim=2).view(L, E, 1, 1)
+        M1 = beta * M1 - g1
+        M2 = beta * M2 - g2
+        W1 = (1.0 - a) * W1 + M1
+        W2 = (1.0 - a) * W2 + M2
+
+    m = torch.cat(outs, dim=2)
+    m = F.layer_norm(m, m.shape[-1:], eps=P["ln_eps"])
+    m = m * P["ln_w"][:, None, None] + P["ln_b"][:, None, None]
+    return m, torch.cat(surprises, dim=2), (W1, W2, M1, M2)

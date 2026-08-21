@@ -1,0 +1,54 @@
+# Original Fast-WAM 30/30 training on the 500-episode MoveCube cache.
+# Official validation episodes 90-99 stay held out; the 400 oracle extension
+# (100-499) joins official training episodes 0-89 for 490 training episodes.
+train_episodes: 500
+exclude_train_episodes: [90, 91, 92, 93, 94, 95, 96, 97, 98, 99]
+
+# Effective global batch = micro batch * GPUs * gradient accumulation.
+# Measured optimum on two NVLink H100 80GB cards: 4 * 2 * 4 = 32.
+batch_size: 32
+micro_batch_size_per_gpu: 4
+gradient_accumulation_steps: 4
+num_epochs: 30
+
+learning_rate: 1.0e-4
+weight_decay: 1.0e-6
+max_grad_norm: 1.0
+mixed_precision: bf16
+seed: 42
+
+# The full 500-episode cache is too large to replicate beside a 30/30 model on
+# each 80 GiB GPU. Keep it in host RAM and transfer only each micro batch.
+cache_storage_device: cpu
+
+# H100-safe speed settings. SDPA selects the fused CUDA attention backend.
+fused_optimizer: false
+zero_redundancy_optimizer: true
+allow_tf32: true
+float32_matmul_precision: high
+cudnn_benchmark: true
+
+# Real H100 measurements showed the saved activations fit and recomputation
+# only reduced throughput. Native DDP + ZeroRedundancyOptimizer is used because
+# DeepSpeed overflowed the patch embedding despite configured clipping.
+mot_checkpoint_mixed_attn: false
+video_gradient_checkpointing: false
+action_gradient_checkpointing: false
+
+sliding_w: 8
+chain_checkpoint_every: 0
+
+log_every: 10
+save_every: 5000
+
+ema:
+  # A 5B+ model's fp32 EMA shadow costs over 20 GiB per rank and does not fit
+  # alongside ZeRO optimizer state on 80 GiB cards.
+  enabled: false
+  decay: 0.9999
+
+wandb:
+  enabled: false
+  project: wam-original
+  group: movecube-fastwam-30x30
+  tags: [fastwam, original, movecube, 30x30]

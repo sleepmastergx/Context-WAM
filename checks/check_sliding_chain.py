@@ -67,7 +67,7 @@ def main():
     assert chain.j_max(43) == 2, chain.j_max(43)   # writes s=0, s=8
     assert chain.j_max(47) == 2, chain.j_max(47)   # settled: 47 still reads 2
     assert chain.j_max(49) == 3, chain.j_max(49)   # s=16 ends at 48 <= 48
-    print("1/4 bookkeeping: strictly-before convention holds "
+    print("1/6 bookkeeping: strictly-before convention holds "
           "(43->2, 47->2, 49->3)")
 
     # ---- 2: streaming equivalence ---------------------------------------
@@ -86,7 +86,7 @@ def main():
         for l in range(mem.n_layers):
             d = (mem._m[l][0] - train_m[l][b]).abs().max().item()
             assert d < 1e-5, f"stream/train mismatch ep{e} t{t} layer{l}: {d}"
-    print(f"2/4 streaming == training chain (J={int(stats['chain_J'])}, "
+    print(f"2/6 streaming == training chain (J={int(stats['chain_J'])}, "
           f"max |diff| < 1e-5)")
 
     # ---- 3: gradient reach ----------------------------------------------
@@ -105,7 +105,7 @@ def main():
     with torch.no_grad():
         chain.load_states(idx)
         assert mem._m[0].grad_fn is None, "no_grad chain still built a graph"
-    print("3/4 gradient reaches cell params AND the learned init; "
+    print("3/6 gradient reaches cell params AND the learned init; "
           "no_grad chain builds no graph")
 
     # ---- 4: checkpointed == plain ---------------------------------------
@@ -121,7 +121,60 @@ def main():
         if n in plain_grads:
             d = (p.grad - plain_grads[n]).abs().max().item()
             assert d < 1e-5, f"checkpointed grad differs on {n}: {d}"
-    print("4/4 checkpoint_every=3 chain == plain chain (readouts and grads)")
+    print("4/6 checkpoint_every=3 chain == plain chain (readouts and grads)")
+
+    # ---- 5: stacked cells == looped cells --------------------------------
+    from memory import ttt_with_state, stack_cells, stacked_init_state, \
+        ttt_with_state_stacked
+    mem.zero_grad(set_to_none=True)
+    x = torch.randn(3, 4, 56)
+    mask = torch.ones(3, 4)
+    ref, grads_ref = [], {}
+    for cell in mem.cells:
+        st = None
+        for rep in range(2):                       # two chained windows
+            m, _, st = ttt_with_state(cell, x * (0.8 ** rep), mask, st)
+        ref.append(m)
+    torch.stack(ref).sum().backward()
+    grads_ref = {n: p.grad.detach().clone()
+                 for n, p in mem.named_parameters() if p.grad is not None}
+    mem.zero_grad(set_to_none=True)
+    P = stack_cells(list(mem.cells))
+    st = stacked_init_state(P, 3)
+    for rep in range(2):
+        m, _, st = ttt_with_state_stacked(P, x * (0.8 ** rep), mask, st)
+    d = (m - torch.stack(ref)).abs().max().item()
+    assert d < 1e-5, f"stacked readout differs from looped: {d}"
+    m.sum().backward()
+    for n, p in mem.named_parameters():
+        if n in grads_ref:
+            d = (p.grad - grads_ref[n]).abs().max().item()
+            assert d < 1e-5, f"stacked grad differs on {n}: {d}"
+    print("5/6 stacked-over-cells chain == per-cell loop (readouts and grads)")
+
+    # ---- 6: chain-once accumulation protocol == fused backward -----------
+    # d(sum_k loss_k)/dtheta via detached leaves + one chain backward must
+    # equal backprop of the summed loss straight through readouts().
+    proj = torch.nn.Linear(24, 1)                  # stand-in for the 5B DiT
+    losses = lambda mlist, sl: sum(                # noqa: E731
+        proj(mlist[l][sl]).pow(2).mean() for l in range(mem.n_layers))
+    mem.zero_grad(set_to_none=True)
+    ms, _ = chain.readouts(idx)
+    (losses(ms, slice(0, 1)) + losses(ms, slice(1, 2))).backward()
+    fused = {n: p.grad.detach().clone()
+             for n, p in mem.named_parameters() if p.grad is not None}
+    mem.zero_grad(set_to_none=True)
+    proj.zero_grad(set_to_none=True)
+    ms, _ = chain.readouts(idx)
+    leaves = [m.detach().requires_grad_(True) for m in ms]
+    for k in range(2):                             # two "micro-batches"
+        losses(leaves, slice(k, k + 1)).backward()
+    torch.autograd.backward(ms, [leaf.grad for leaf in leaves])
+    for n, p in mem.named_parameters():
+        if n in fused:
+            d = (p.grad - fused[n]).abs().max().item()
+            assert d < 1e-6, f"chain-once grad differs on {n}: {d}"
+    print("6/6 chain-once accumulation protocol == fused backward")
 
     print("ALL PASS — sliding chain is safe to train with")
 
