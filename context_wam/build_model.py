@@ -57,9 +57,16 @@ def build(cfg, device="cuda"):
             f"memory.n_layers={mem_cfg['n_layers']} but the action expert has "
             f"{n_layers} blocks — the per-layer states would silently misalign.")
 
+    # The seam is `mixed_attn_out` (mot.py:121), the attention output BEFORE
+    # self_attn.o -- width num_heads*attn_head_dim, not the expert width. Read
+    # it off the model rather than re-deriving it from the config, so a config
+    # change can never silently desynchronise the readout from the seam.
+    seam_dims = [blk.self_attn.o.in_features for blk in action_expert.blocks]
+
     memory = PerLayerEpisodeMemory(
         n_layers=n_layers,
         hidden_dim=int(mem_cfg["hidden_dim"]),
+        seam_dims=seam_dims,
         latent_channels=int(mem_cfg["latent_channels"]),
         proprio_dim=cfg.model.get("proprio_dim", None),
         d_k=int(mem_cfg["d_k"]), d_v=int(mem_cfg["d_v"]),

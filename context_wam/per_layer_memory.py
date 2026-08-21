@@ -41,6 +41,7 @@ class PerLayerEpisodeMemory(nn.Module):
         self,
         n_layers: int,
         hidden_dim: int,                 # action expert width (1024)
+        seam_dims: Optional[Sequence[int]] = None,
         latent_channels: int = 48,
         proprio_dim: Optional[int] = None,
         d_k: int = 128,
@@ -63,9 +64,23 @@ class PerLayerEpisodeMemory(nn.Module):
                       d_out=d_out, chunk=chunk)
             for _ in range(n_cells)
         ])
-        # per-layer readout -> action-expert width, gated near zero
+        # Per-layer readout -> the width of the tensor we actually add to,
+        # gated near zero. The seam is `mixed_attn_out`, which is the attention
+        # output BEFORE self_attn.o, i.e. num_heads * attn_head_dim (3072 for
+        # the M5 action expert) -- NOT the expert width (1024). Those two are
+        # equal in synthetic_model.py (o = Linear(d, d)) and unequal in the real
+        # model (o = Linear(3072, 1024), wan_video_dit.py:182), which is exactly
+        # why the synthetic smoke passed while the real model raised. Callers
+        # pass seam_dims read off the model; hidden_dim stays the fallback so
+        # the synthetic path is unchanged.
+        self.seam_dims = ([int(d) for d in seam_dims] if seam_dims is not None
+                          else [int(hidden_dim)] * self.n_layers)
+        if len(self.seam_dims) != self.n_layers:
+            raise ValueError(
+                f"seam_dims has {len(self.seam_dims)} entries but n_layers="
+                f"{self.n_layers}")
         self.to_hidden = nn.ModuleList([
-            nn.Linear(d_out, hidden_dim) for _ in range(self.n_layers)
+            nn.Linear(d_out, self.seam_dims[l]) for l in range(self.n_layers)
         ])
         self.alpha = nn.Parameter(torch.full((self.n_layers,), float(gate_init)))
 
@@ -117,8 +132,8 @@ class PerLayerEpisodeMemory(nn.Module):
     def read_layer(self, layer: int, seq_len: int, dtype: torch.dtype):
         """Gated per-layer contribution, broadcast over the action tokens.
 
-        Returns [B, seq_len, hidden_dim] to add to `mixed_attn_out`, or None
-        before the first advance() (then the block is stock Fast-WAM).
+        Returns [B, seq_len, seam_dims[layer]] to add to `mixed_attn_out`, or
+        None before the first advance() (then the block is stock Fast-WAM).
         """
         m = self._m[layer]
         if m is None:
@@ -146,6 +161,13 @@ def patch_mot_action_expert(mot, memory: PerLayerEpisodeMemory,
             add = memory.read_layer(layer, mixed_attn_out.shape[1],
                                     mixed_attn_out.dtype)
             if add is not None:
+                if add.shape[-1] != mixed_attn_out.shape[-1]:
+                    raise RuntimeError(
+                        f"TTT seam width mismatch at action layer {layer}: "
+                        f"memory readout is {add.shape[-1]}-d but "
+                        f"mixed_attn_out is {mixed_attn_out.shape[-1]}-d. "
+                        f"Build the memory with seam_dims=[blk.self_attn.o."
+                        f"in_features for blk in action_expert.blocks].")
                 mixed_attn_out = mixed_attn_out + add
         return __orig(block=block, residual_x=residual_x,
                       mixed_attn_out=mixed_attn_out, gate_msa=gate_msa,

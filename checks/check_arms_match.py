@@ -66,8 +66,14 @@ def main():
     fusion = 10_242
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "context_wam"))
     from per_layer_memory import PerLayerEpisodeMemory
+    # Readouts are built at the SEAM width (attention output, pre-o-projection),
+    # which build_model.py reads off the model; mirror that here so the reported
+    # asymmetry is the one the run actually pays.
+    seam = (a["action_dit_config.num_heads"]
+            * a["action_dit_config.attn_head_dim"])
     mem = PerLayerEpisodeMemory(
         n_layers=a["memory.n_layers"], hidden_dim=a["memory.hidden_dim"],
+        seam_dims=[seam] * a["memory.n_layers"],
         latent_channels=a["memory.latent_channels"], proprio_dim=8,
         d_out=a["memory.d_out"], chunk=a["memory.chunk"],
         gate_init=a["memory.gate_init"])
