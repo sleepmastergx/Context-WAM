@@ -137,6 +137,8 @@ def main():
         a = (act_n + 1.0) / 2.0 * (a_max - a_min + eps) + a_min
         if stats["mode"] == "delta_norm":
             a[:, :7] = a[:, :7] + raw_state[None, :7]
+        # eef_delta_norm: return [dp(3), rotvec(3), grip] -- the CLIENT composes
+        # the absolute EEF target from the env's current TCP pose
         return a.astype(np.float32)
 
     tc = torch.load(args.text_context, map_location="cpu", weights_only=False)
@@ -251,7 +253,7 @@ def main():
             n_req += 1
             if n_req % 50 == 1:
                 print(f"req {n_req}: {time.time()-t1:.2f}s/infer", flush=True)
-            send_msg(conn, {"action": act})
+            send_msg(conn, {"action": act, "mode": (stats["mode"] if stats else "raw")})
         conn.close()
 
 

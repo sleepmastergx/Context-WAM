@@ -63,6 +63,7 @@ class GPUWindowCache:
         keep = set(eps)
 
         lat, act, sta, ep_id, start, is_exec = [], [], [], [], [], []
+        eef_win, eef_anchor = [], []
         for e in eps:
             f = f"{root}/ep{e:04d}.npz"
             if not os.path.exists(f):
@@ -75,6 +76,12 @@ class GPUWindowCache:
             idx = np.clip(starts[:, None] + np.arange(H)[None, :], 0, T - 1)
             act.append(torch.from_numpy(A[idx]).to(dtype))
             sta.append(torch.from_numpy(S[np.clip(starts, 0, T - 1)]).to(dtype))
+            if action_mode == "eef_delta_norm":
+                if "eef_action_pq" not in z.files:
+                    raise KeyError(f"{f}: no eef_action_pq -- run context_wam/add_eef_to_cache.py")
+                EA, ES = z["eef_action_pq"].astype(np.float32), z["eef_state_pq"].astype(np.float32)
+                eef_win.append(torch.from_numpy(EA[idx]))                       # [n,H,7] abs p,q
+                eef_anchor.append(torch.from_numpy(ES[np.clip(starts, 0, T - 1)]))  # [n,7]
             ep_id.append(torch.full((len(starts),), e, dtype=torch.int32))
             start.append(torch.from_numpy(starts.astype(np.int32)))
             is_exec.append(torch.from_numpy(
@@ -84,7 +91,10 @@ class GPUWindowCache:
         self.actions = torch.cat(act).to(self.storage_device)
         self.states = torch.cat(sta).to(self.storage_device)
         self.action_mode = action_mode
+        if action_mode == "eef_delta_norm":
+            self._eef_win = torch.cat(eef_win); self._eef_anchor = torch.cat(eef_anchor)
         self.action_stats = self._normalize(action_mode, dtype)
+        self.action_dim = int(self.actions.shape[-1])
         self.ep = torch.cat(ep_id).to(self.storage_device)
         self.start = torch.cat(start).to(self.storage_device)
         self.is_exec = torch.cat(is_exec).to(self.storage_device)
@@ -147,7 +157,7 @@ class GPUWindowCache:
                      2.9) the motion is at the quantization floor.
         norm       : min/max per dim -> [-1, 1] (what the DP pipeline's
                      DataTransform does), proprio likewise.
-        delta_norm : joints relative to the window-start joint state
+        eef_delta_norm : 7-d [dp(3), rotvec(3), gripper] relative to the\n                     window-start TCP pose (needs eef_*_pq from add_eef_to_cache.py)\n        delta_norm : joints relative to the window-start joint state
                      (a_k - q_0, gripper stays absolute), then min/max -> [-1,1]
                      -- the joint-space analog of the real-robot EEF-delta recipe.
         Stats are computed over the loaded (training) windows and returned so
@@ -156,13 +166,24 @@ class GPUWindowCache:
         """
         if mode == "raw":
             return None
-        if mode not in ("norm", "delta_norm"):
-            raise ValueError(f"action_mode must be raw|norm|delta_norm, got {mode!r}")
+        if mode not in ("norm", "delta_norm", "eef_delta_norm"):
+            raise ValueError(f"action_mode must be raw|norm|delta_norm|eef_delta_norm, got {mode!r}")
         A = self.actions.float()                       # [N, H, 8]
         S = self.states.float()                        # [N, 8]
         if mode == "delta_norm":
             A = A.clone()
             A[:, :, :7] = A[:, :, :7] - S[:, None, :7]
+        elif mode == "eef_delta_norm":
+            # window-relative EEF deltas: dp = p_k - p_0, rotvec(R_0^T R_k),
+            # gripper absolute -> 7-d. Anchor = TCP pose at the window start
+            # (eef_state_pq), which the eval client reads off the env.
+            from context_wam.se3 import relative_rotvec
+            W = self._eef_win.numpy(); Anc = self._eef_anchor.numpy()
+            dp = W[:, :, :3] - Anc[:, None, :3]
+            rv = relative_rotvec(np.repeat(Anc[:, None, 3:7], W.shape[1], axis=1), W[:, :, 3:7])
+            grip = A[:, :, 7:8].numpy()
+            A = torch.from_numpy(np.concatenate([dp, rv, grip], axis=-1).astype(np.float32))
+            del self._eef_win, self._eef_anchor
         eps = 1e-6
         a_min, a_max = A.amin(dim=(0, 1)), A.amax(dim=(0, 1))
         s_min, s_max = S.amin(dim=0), S.amax(dim=0)

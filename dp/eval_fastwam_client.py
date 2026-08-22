@@ -66,6 +66,10 @@ def main():
                          "switch modes). fixed: one seed per episode, so "
                          "consecutive replans stay in the same mode -- the "
                          "candidate for small R (TTT cadence needs R=8).")
+    ap.add_argument("--action-space", default="joint_angle", choices=["joint_angle", "ee_pose"],
+                    help="ee_pose: the server returns EEF deltas (eef_delta_norm "
+                         "checkpoints); composed here against the env's TCP pose and "
+                         "stepped through the benchmark's ee_pose wrapper")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -86,8 +90,23 @@ def main():
 
     from robomme.env_record_wrapper import BenchmarkEnvBuilder
     builder = BenchmarkEnvBuilder(env_id=args.task, dataset=args.split,
-                                  action_space="joint_angle",
+                                  action_space=args.action_space,
                                   max_steps=args.max_steps)
+    if args.action_space == "ee_pose":
+        import torch
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+        from context_wam.se3 import compose
+        from robomme.robomme_env.utils.rpy_util import quat_wxyz_to_rpy_xyz_torch
+
+        def to_env_actions(deltas, env):
+            """[H,7] (dp, rotvec, grip) -> [H,7] absolute (xyz, rpy, grip)."""
+            tcp = env.unwrapped.agent.tcp.pose
+            p0 = np.asarray(tcp.p, np.float64).reshape(-1)[:3]
+            q0 = np.asarray(tcp.q, np.float64).reshape(-1)[:4]       # wxyz
+            p, q = compose(p0[None], q0[None], deltas[:, :3].astype(np.float64),
+                           deltas[:, 3:6].astype(np.float64))
+            rpy = quat_wxyz_to_rpy_xyz_torch(torch.as_tensor(q)).numpy()
+            return np.concatenate([p, rpy, deltas[:, 6:7]], axis=-1).astype(np.float32)
     n = min(args.episodes, builder.get_episode_num())
     my_eps = list(range(n))[args.shard::args.num_shards]
 
@@ -127,7 +146,12 @@ def main():
                             "seed": ep_i * 100000 + (0 if args.noise_mode == "fixed" else replans)})
             first = False
             new_f, new_w, new_s = [], [], []
-            acts = recv_msg(conn)["action"]
+            resp = recv_msg(conn)
+            acts = resp["action"]
+            if args.action_space == "ee_pose":
+                assert resp.get("mode") == "eef_delta_norm", \
+                    f"ee_pose client needs an eef_delta_norm checkpoint, server mode={resp.get('mode')}"
+                acts = to_env_actions(np.asarray(acts, np.float32), env)
             replans += 1
             for a in acts[:args.exec_horizon]:
                 obs, _, terminated, truncated, info = env.step(

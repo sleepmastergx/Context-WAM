@@ -304,6 +304,18 @@ def main():
             storage_device=cache_storage_device,
             action_mode=str(cfg.get("action_mode", "raw")),
         )
+    # the action dim is a property of the cache's action_mode (8 joints+grip,
+    # or 7 for EEF deltas); both experts' action_dim must follow it, and the
+    # override lands in the saved cfg so the eval server rebuilds the same model
+    cache_adim = getattr(cache, "action_dim", None)
+    if cache_adim is not None:
+        for key in ("video_dit_config", "action_dit_config"):
+            if int(cfg["model"][key].get("action_dim", cache_adim)) != cache_adim:
+                print(f"model.{key}.action_dim -> {cache_adim} (cache action_mode="
+                      f"{getattr(cache, 'action_mode', 'raw')})", flush=True)
+                cfg["model"][key]["action_dim"] = cache_adim
+        if "proprio_dim" in cfg["model"]:
+            pass  # proprio stays the 8-d joint state in every mode
     exec_idx = cache.exec_indices()
     effective_batch = int(cfg["batch_size"])
     batch_divisor = world * grad_accum
