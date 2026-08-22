@@ -1,0 +1,137 @@
+# TOKENS-WRITE variant of fastwam_ttt_m5.yaml: identical except memory.write_input
+# (+chunk/patch). Arms-match gate: python checks/check_arms_match.py fastwam_ttt_m5_tokens
+# FastWAM + TTT episodic memory, MoveCube, trained from scratch.
+#
+# Derived from their configs/model/fastwam_decoupled.yaml with four deliberate
+# changes (everything else is byte-identical to theirs):
+#
+#   1. kv_source_mode: uniform_end -> fused_mlp
+#      uniform_end SELECTS 5 of 30 video layers (25 never read). fused_mlp
+#      fuses ALL 30 via KVFusionModule (Linear(30->64)->GELU->Linear(64->1),
+#      10,242 params, shared over tokens+channels). Their completed
+#      LIBERO M1_FusedMLP_RopeFixed / RoboTwin M1_FusedMLP runs use this.
+#
+#   2. action_dit num_layers stays 5 (not their M1=1). With fusion every layer
+#      already sees all 30 video layers, so depth buys TTT INJECTION POINTS,
+#      not video visibility: 5 memory states instead of 1. 115M trainable,
+#      the closest option to the 67M DP that scored 24% on this task.
+#
+#   3. skip_dit_load_from_pretrain: true + action_dit_pretrained_path: null
+#      -> the action expert is RANDOM INIT. "From scratch" means the policy;
+#      the Wan2.2 video backbone keeps its pretrained weights (random-init of
+#      a 5B video DiT needs millions of videos, not 100 episodes).
+#
+#   4. freeze_video_backbone: FALSE -- THEIR recipe. _apply_dit_only_train_mode
+#      unfreezes model.dit (= mot: BOTH experts) + proprio_encoder; only VAE and
+#      T5 stay frozen. Freezing the video expert would make this "a small head on
+#      frozen Wan2.2 features" -- our stage-2 setup again -- losing the joint
+#      video+action denoising that IS FastWAM. ~5B trainable, so this MUST launch
+#      under their ZeRO-1 config (AdamW state alone is 56 GiB).
+#
+# CAVEAT ON RECORD: fused_mlp is unpublished Faster-WAM work (paper/FasterWAM_short
+# is a draft). Results are NOT comparable to published Fast-WAM numbers, and their
+# own audit notes fused K is RMSNorm'd twice (per-layer norm_k, then post-fusion)
+# while V is normed once -- new_fused_kv's key-only norm looks like the fix.
+# Confirm with Rui Heng before treating this as settled.
+_target_: fastwam.runtime.create_fastwam_decoupled
+model_id: Wan-AI/Wan2.2-TI2V-5B
+tokenizer_model_id: Wan-AI/Wan2.1-T2V-1.3B
+tokenizer_max_len: 128
+load_text_encoder: false
+proprio_dim: 8                   # MoveCube state dim (was a
+                                 # ${data.train...} interpolation into a
+                                 # hydra tree we do not supply; that
+                                 # InterpolationKeyError killed job 1394)
+redirect_common_files: true
+mot_checkpoint_mixed_attn: true
+
+action_dit_pretrained_path: null
+skip_dit_load_from_pretrain: false   # was true — see comment 3 above. That flag
+                                     # is passed to BOTH experts: loader.py
+                                     # random-inits the 5B VIDEO DiT under it
+                                     # (dit_path = SKIPPED_PRETRAIN sentinel),
+                                     # which is the opposite of the stated
+                                     # intent and NaN'd this task at step ~2.
+                                     # false + action_dit_pretrained_path: null
+                                     # gives what comment 3 describes: video
+                                     # backbone pretrained, action expert still
+                                     # truncated-Gaussian random init.
+freeze_video_backbone: false
+decoupled: true
+
+kv_source_mode: "fused_mlp"
+fusion_hidden_dim: 64
+fusion_use_norm: true
+
+video_dit_config:
+  has_image_input: false
+  patch_size: [1, 2, 2]
+  in_dim: 48
+  hidden_dim: 3072
+  ffn_dim: 14336
+  freq_dim: 256
+  text_dim: 4096
+  out_dim: 48
+  num_heads: 24
+  attn_head_dim: 128
+  num_layers: 30
+  eps: 1.0e-06
+  seperated_timestep: true
+  require_clip_embedding: false
+  require_vae_embedding: false
+  fuse_vae_embedding_in_latents: true
+  use_gradient_checkpointing: true   # was ${model.*}: only resolves
+                                    # nested under their hydra tree
+  video_attention_mask_mode: "first_frame_causal"
+  action_conditioned: false
+  action_dim: 8                    # MoveCube action dim (literal, see above)
+  action_group_causal_mask_mode: "group_diagonal"
+
+action_dit_config:
+  action_dim: 8                    # MoveCube action dim (literal, see above)
+  hidden_dim: 1024
+  ffn_dim: 4096
+  num_heads: 24
+  attn_head_dim: 128
+  num_layers: 5
+  layer_selected: null
+  text_dim: 4096
+  freq_dim: 256
+  eps: 1.0e-06
+  use_gradient_checkpointing: true   # was ${model.*}: only resolves
+                                    # nested under their hydra tree
+  action_text_cross_attn: true
+
+video_scheduler:
+  train_shift: 5.0
+  infer_shift: 5.0
+  num_train_timesteps: 1000
+
+action_scheduler:
+  train_shift: 5.0
+  infer_shift: 5.0
+  num_train_timesteps: 1000
+
+# joint video+action denoising: both terms weighted 1.0, as theirs
+loss:
+  lambda_video: 1.0
+  lambda_action: 1.0
+
+# --- ours: TTT episodic memory (exp/fastwam_ttt/per_layer_memory.py) ---
+memory:
+  enabled: true
+  n_layers: 5              # MUST equal action_dit_config.num_layers
+  hidden_dim: 1024         # MUST equal action_dit_config.hidden_dim
+  latent_channels: 48      # video_dit_config.in_dim
+  d_k: 128
+  d_v: 128
+  d_hidden: 512
+  d_out: 256
+  chunk: 384               # tokens mode: ONE batched write per window (= n_tokens)
+  write_input: tokens      # memory writes from the patchified latent tokens the
+                           # action expert attends to (3 x 8 x 16 = 384 tokens of
+                           # 48*2*2 = 192-d + learned position), NOT the spatial
+                           # mean (48-d), which discards all spatial layout
+  patch: 2                 # = video_dit_config.patch_size (1,2,2) spatial
+  gate_init: 0.001         # RoboTTT: tanh(alpha), alpha ~ 0 => stock model at init
+  share_cell: false

@@ -51,11 +51,30 @@ class PerLayerEpisodeMemory(nn.Module):
         chunk: int = 1,                  # one inner step per latent frame
         gate_init: float = 1e-3,
         share_cell: bool = False,
+        write_input: str = "pooled",     # "pooled" | "tokens" (see pool_latents)
+        patch: int = 2,                  # tokens mode: spatial patch, = video DiT (1,2,2)
+        latent_thw: Sequence[int] = (3, 16, 32),   # tokens mode: window latent [t,h,w]
     ):
         super().__init__()
         self.n_layers = int(n_layers)
         self.proprio_dim = proprio_dim
-        d_in = latent_channels + (proprio_dim or 0)
+        if write_input not in ("pooled", "tokens"):
+            raise ValueError(f"write_input must be 'pooled' or 'tokens', got {write_input!r}")
+        self.write_input = write_input
+        self.patch = int(patch)
+        self.latent_thw = tuple(int(v) for v in latent_thw)
+        if write_input == "tokens":
+            t, h, w = self.latent_thw
+            if h % self.patch or w % self.patch:
+                raise ValueError(f"latent h,w {h},{w} not divisible by patch {self.patch}")
+            self.n_tokens = t * (h // self.patch) * (w // self.patch)
+            d_tok = latent_channels * self.patch * self.patch
+            # learned time+space position so the write keeps spatial identity
+            self.pos = nn.Parameter(torch.randn(1, self.n_tokens, d_tok) * 0.02)
+            d_in = d_tok + (proprio_dim or 0)
+        else:
+            self.n_tokens = self.latent_thw[0]
+            d_in = latent_channels + (proprio_dim or 0)
         self.share_cell = bool(share_cell)
 
         n_cells = 1 if share_cell else self.n_layers
@@ -97,11 +116,31 @@ class PerLayerEpisodeMemory(nn.Module):
         return self.cells[0] if self.share_cell else self.cells[layer]
 
     def pool_latents(self, video_latents, proprio=None):
-        """[B, C, t, h, w] -> [B, t, d_in]; t inner steps per window."""
+        """[B, C, t, h, w] -> [B, N, d_in]: the memory's write input for one window.
+
+        pooled: N = t, spatial MEAN of each latent frame (48-d) -- the original
+                design; discards all spatial layout.
+        tokens: N = t*(h/p)*(w/p) patchified tokens (C*p*p-d) + learned
+                position -- the SAME view of the latent the action expert
+                attends to (video DiT patch (1,2,2)). Use chunk = N so a window
+                is one batched write.
+        Both branches are the single seam used by SlidingChain._seg (training)
+        and advance() (deploy), so the chain gates cover either mode.
+        """
         if video_latents.ndim != 5:
             raise ValueError(
                 f"video_latents must be 5D [B,C,t,h,w], got {tuple(video_latents.shape)}")
-        x = video_latents.mean(dim=(3, 4)).transpose(1, 2)
+        if self.write_input == "tokens":
+            B, C, t, h, w = video_latents.shape
+            if (t, h, w) != self.latent_thw:
+                raise ValueError(f"window latent [t,h,w]={(t,h,w)} != built "
+                                 f"latent_thw={self.latent_thw}")
+            p = self.patch
+            x = video_latents.reshape(B, C, t, h // p, p, w // p, p)
+            x = x.permute(0, 2, 3, 5, 1, 4, 6).reshape(B, self.n_tokens, C * p * p)
+            x = x + self.pos.to(x.dtype)
+        else:
+            x = video_latents.mean(dim=(3, 4)).transpose(1, 2)
         if self.proprio_dim is not None:
             if proprio is None:
                 raise ValueError("built with proprio_dim but got proprio=None")

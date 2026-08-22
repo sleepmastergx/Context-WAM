@@ -14,6 +14,7 @@
 Runs on CPU in a few seconds:  python checks/check_sliding_chain.py
 """
 import pathlib
+import os
 import sys
 
 import numpy as np
@@ -50,9 +51,11 @@ class FakeCache:
 
 def build_memory():
     torch.manual_seed(1)
+    mode = os.environ.get("CHAIN_WRITE_INPUT", "pooled")   # pooled | tokens
     return PerLayerEpisodeMemory(
         n_layers=2, hidden_dim=64, latent_channels=48, proprio_dim=8,
-        d_k=16, d_v=16, d_hidden=32, d_out=24, chunk=1).float()
+        d_k=16, d_v=16, d_hidden=32, d_out=24,
+        chunk=(384 if mode == "tokens" else 1), write_input=mode).float()
 
 
 def main():
@@ -127,7 +130,8 @@ def main():
     from memory import ttt_with_state, stack_cells, stacked_init_state, \
         ttt_with_state_stacked
     mem.zero_grad(set_to_none=True)
-    x = torch.randn(3, 4, 56)
+    d_in = mem.cells[0].ln_in.normalized_shape[0]   # 56 pooled / 200 tokens
+    x = torch.randn(3, 4, d_in)
     mask = torch.ones(3, 4)
     ref, grads_ref = [], {}
     for cell in mem.cells:

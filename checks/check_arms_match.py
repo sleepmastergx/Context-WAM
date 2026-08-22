@@ -31,7 +31,8 @@ def flatten(d, prefix=""):
 
 
 def main():
-    ttt = yaml.safe_load(open(f"{CFG}/fastwam_ttt_m5.yaml"))
+    ttt_name = sys.argv[1] if len(sys.argv) > 1 else "fastwam_ttt_m5"
+    ttt = yaml.safe_load(open(f"{CFG}/{ttt_name}.yaml"))
     ctl = yaml.safe_load(open(f"{CFG}/fastwam_ttt_m5_control.yaml"))
     a, b = flatten(ttt), flatten(ctl)
 

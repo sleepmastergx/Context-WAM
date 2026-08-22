@@ -62,6 +62,7 @@ from sliding_chain import SlidingChain          # noqa: E402
 ARM_CFG = {
     "control": "fastwam_ttt_m5_control",
     "ttt": "fastwam_ttt_m5",
+    "ttt_tokens": "fastwam_ttt_m5_tokens",
     "original": "fastwam_original_m30",
 }
 
@@ -177,7 +178,9 @@ def build_arm(cfg, device, synthetic):
             proprio_dim=m.get("proprio_dim", 8),
             d_k=mm["d_k"], d_v=mm["d_v"], d_hidden=mm["d_hidden"],
             d_out=mm["d_out"], chunk=mm["chunk"],
-            gate_init=mm["gate_init"]).to(device).float()
+            gate_init=mm["gate_init"],
+            write_input=mm.get("write_input", "pooled"),
+            patch=mm.get("patch", 2)).to(device).float()
         tag_action_blocks(model.mot.mixtures["action"])
         patch_mot_action_expert(model.mot, memory)
     return model, memory
@@ -229,7 +232,7 @@ def main():
     if "action_gradient_checkpointing" in cfg:
         cfg["model"]["action_dit_config"]["use_gradient_checkpointing"] = bool(
             cfg["action_gradient_checkpointing"])
-    is_ttt = args.arm == "ttt"
+    is_ttt = args.arm.startswith("ttt")
     if is_ttt != bool(cfg["model"].get("memory", {}).get("enabled", False)):
         raise SystemExit(f"--arm {args.arm} does not match memory.enabled in "
                          f"{ARM_CFG[args.arm]}.yaml — refusing to guess")

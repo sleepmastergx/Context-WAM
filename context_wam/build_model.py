@@ -73,6 +73,9 @@ def build(cfg, device="cuda"):
         d_hidden=int(mem_cfg["d_hidden"]), d_out=int(mem_cfg["d_out"]),
         chunk=int(mem_cfg["chunk"]), gate_init=float(mem_cfg["gate_init"]),
         share_cell=bool(mem_cfg.get("share_cell", False)),
+        write_input=str(mem_cfg.get("write_input", "pooled")),
+        patch=int(mem_cfg.get("patch", 2)),
+        latent_thw=tuple(mem_cfg.get("latent_thw", (3, 16, 32))),
     ).to(device)
 
     tag_action_blocks(action_expert)
