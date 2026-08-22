@@ -139,6 +139,7 @@ class SyntheticWindowCache:
         self.context = torch.zeros(4, 4096)
         self.context_mask = torch.ones(4, dtype=torch.bool)
         self.source_video_shape = torch.tensor([[3, 9, 256, 512]])
+        self.action_stats = None
 
     def exec_indices(self):
         return torch.nonzero(self.is_exec, as_tuple=False).squeeze(-1)
@@ -197,11 +198,15 @@ def make_sched(opt, total_steps):
         milestones=[warmup])
 
 
-def save_ckpt(path, step, cfg, model_state, memory, ema):
+def save_ckpt(path, step, cfg, model_state, memory, ema, action_stats=None):
     torch.save({"step": step, "cfg": cfg,
                 "model": model_state,
                 "memory": memory.state_dict() if memory is not None else None,
-                "ema": ema.state_dict() if ema is not None else None}, path)
+                "ema": ema.state_dict() if ema is not None else None,
+                # action/proprio normalization used at training time (None =
+                # raw); the eval server inverts it -- never evaluate a
+                # normalized-trained model as raw
+                "action_stats": action_stats}, path)
 
 
 def main():
@@ -297,6 +302,7 @@ def main():
             device,
             split_episodes=train_episodes,
             storage_device=cache_storage_device,
+            action_mode=str(cfg.get("action_mode", "raw")),
         )
     exec_idx = cache.exec_indices()
     effective_batch = int(cfg["batch_size"])
@@ -692,7 +698,8 @@ def main():
             model_state = raw.model.state_dict()
         if is_main and should_save:
             save_ckpt(out / "checkpoints" / f"step_{gstep}.pt",
-                      gstep, cfg, model_state, memory, ema)
+                      gstep, cfg, model_state, memory, ema,
+                      action_stats=getattr(cache, "action_stats", None))
         if should_save and accelerator is not None:
             accelerator.wait_for_everyone()
 

@@ -43,6 +43,7 @@ class GPUWindowCache:
         split_episodes=None,
         dtype=torch.bfloat16,
         storage_device=None,
+        action_mode: str = "raw",   # raw | norm | delta_norm (see _normalize)
     ):
         metas = sorted(glob.glob(f"{root}/meta*.json"))
         if not metas:
@@ -82,6 +83,8 @@ class GPUWindowCache:
         self.latents = torch.cat(lat).to(self.storage_device)
         self.actions = torch.cat(act).to(self.storage_device)
         self.states = torch.cat(sta).to(self.storage_device)
+        self.action_mode = action_mode
+        self.action_stats = self._normalize(action_mode, dtype)
         self.ep = torch.cat(ep_id).to(self.storage_device)
         self.start = torch.cat(start).to(self.storage_device)
         self.is_exec = torch.cat(is_exec).to(self.storage_device)
@@ -133,6 +136,43 @@ class GPUWindowCache:
 
     def __len__(self):
         return len(self.latents)
+
+    # ---- action / proprio conditioning -----------------------------------
+    def _normalize(self, mode, dtype):
+        """Put actions/proprio on the scale flow matching expects.
+
+        raw        : cached absolute joint targets in radians (the original
+                     runs). Targets sit at offsets of +-2 rad while per-step
+                     motion is 0.005-0.05 rad -- at bf16 resolution (~0.011 at
+                     2.9) the motion is at the quantization floor.
+        norm       : min/max per dim -> [-1, 1] (what the DP pipeline's
+                     DataTransform does), proprio likewise.
+        delta_norm : joints relative to the window-start joint state
+                     (a_k - q_0, gripper stays absolute), then min/max -> [-1,1]
+                     -- the joint-space analog of the real-robot EEF-delta recipe.
+        Stats are computed over the loaded (training) windows and returned so
+        train.py can bake them into every checkpoint; the eval server inverts
+        them. Returns None for raw.
+        """
+        if mode == "raw":
+            return None
+        if mode not in ("norm", "delta_norm"):
+            raise ValueError(f"action_mode must be raw|norm|delta_norm, got {mode!r}")
+        A = self.actions.float()                       # [N, H, 8]
+        S = self.states.float()                        # [N, 8]
+        if mode == "delta_norm":
+            A = A.clone()
+            A[:, :, :7] = A[:, :, :7] - S[:, None, :7]
+        eps = 1e-6
+        a_min, a_max = A.amin(dim=(0, 1)), A.amax(dim=(0, 1))
+        s_min, s_max = S.amin(dim=0), S.amax(dim=0)
+        A = 2.0 * (A - a_min) / (a_max - a_min + eps) - 1.0
+        S = 2.0 * (S - s_min) / (s_max - s_min + eps) - 1.0
+        self.actions = A.to(dtype).to(self.storage_device)
+        self.states = S.to(dtype).to(self.storage_device)
+        return {"mode": mode, "eps": eps,
+                "action_min": a_min.tolist(), "action_max": a_max.tolist(),
+                "state_min": s_min.tolist(), "state_max": s_max.tolist()}
 
     def exec_indices(self):
         return torch.nonzero(self.is_exec, as_tuple=False).squeeze(-1)

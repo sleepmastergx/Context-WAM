@@ -78,7 +78,7 @@ def main():
     ap.add_argument("--run-dir", required=True)
     ap.add_argument("--ckpt", required=True, help="e.g. ckpt_200000.pth")
     ap.add_argument("--task", default="MoveCube")
-    ap.add_argument("--split", default="test", choices=["val", "test"],
+    ap.add_argument("--split", default="test", choices=["train", "val", "test"],
                     help="checkpoint-selection sweeps use val; report test once")
     ap.add_argument("--episodes", type=int, default=50)
     ap.add_argument("--max-steps", type=int, default=1300)

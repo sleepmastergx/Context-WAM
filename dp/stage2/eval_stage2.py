@@ -157,7 +157,7 @@ def main():
                     help="stage-1 DP run dir (frozen encoder + stats.json)")
     ap.add_argument("--stage1-ckpt", default="ckpt_200000.pth")
     ap.add_argument("--task", default="MoveCube")
-    ap.add_argument("--split", default="val", choices=["val", "test"])
+    ap.add_argument("--split", default="val", choices=["train", "val", "test"])
     ap.add_argument("--episodes", type=int, default=50)
     ap.add_argument("--max-steps", type=int, default=1300)
     ap.add_argument("--shard", type=int, default=0)

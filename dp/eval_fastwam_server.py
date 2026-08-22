@@ -118,6 +118,27 @@ def main():
     print(f"model loaded from step {ck.get('step')} in {time.time()-t0:.0f}s",
           flush=True)
 
+    stats = ck.get("action_stats")
+    if stats:
+        print(f"action_mode={stats['mode']}: normalizing proprio and "
+              f"de-normalizing actions with the checkpoint's stats", flush=True)
+        a_min = np.asarray(stats["action_min"], np.float32); a_max = np.asarray(stats["action_max"], np.float32)
+        s_min = np.asarray(stats["state_min"], np.float32); s_max = np.asarray(stats["state_max"], np.float32)
+        eps = float(stats.get("eps", 1e-6))
+
+    def norm_state(raw):
+        if not stats:
+            return raw
+        return (2.0 * (raw - s_min) / (s_max - s_min + eps) - 1.0).astype(np.float32)
+
+    def denorm_action(act_n, raw_state):
+        if not stats:
+            return act_n
+        a = (act_n + 1.0) / 2.0 * (a_max - a_min + eps) + a_min
+        if stats["mode"] == "delta_norm":
+            a[:, :7] = a[:, :7] + raw_state[None, :7]
+        return a.astype(np.float32)
+
     tc = torch.load(args.text_context, map_location="cpu", weights_only=False)
     assert "context" in tc, "expected the single-goal text_context payload"
     context = tc["context"].unsqueeze(0).to("cuda", model.torch_dtype)
@@ -178,7 +199,7 @@ def main():
                 while ep["writes"] < due:
                     s_j = W * ep["writes"]
                     z = encode_window(ep["frames"], s_j)
-                    pro = torch.from_numpy(ep["states"][s_j][None]).to(
+                    pro = torch.from_numpy(norm_state(ep["states"][s_j])[None]).to(
                         "cuda", torch.float32)
                     with torch.inference_mode():
                         memory.advance(z.float(), pro)
@@ -189,8 +210,8 @@ def main():
             mosaic = np.concatenate([front, wrist], axis=1)      # H, 2W, 3
             img = torch.from_numpy(mosaic).permute(2, 0, 1).float() / 127.5 - 1.0
             img = img.unsqueeze(0).to("cuda", model.torch_dtype)  # [1,3,256,512]
-            proprio = torch.from_numpy(
-                np.asarray(req["state"], np.float32)).unsqueeze(0).to(
+            raw_state = np.asarray(req["state"], np.float32)
+            proprio = torch.from_numpy(norm_state(raw_state)).unsqueeze(0).to(
                 "cuda", model.torch_dtype)
             t1 = time.time()
             with torch.inference_mode():
@@ -226,6 +247,7 @@ def main():
             if isinstance(act, torch.Tensor):
                 act = act.detach().float().cpu().numpy()
             act = np.asarray(act, np.float32).reshape(args.action_horizon, -1)
+            act = denorm_action(act, raw_state)
             n_req += 1
             if n_req % 50 == 1:
                 print(f"req {n_req}: {time.time()-t1:.2f}s/infer", flush=True)
